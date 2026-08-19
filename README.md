@@ -1,1 +1,13 @@
-# raven
+Raven-LLM — project state summary
+
+Building a minimal LLM from scratch in Common Lisp (SBCL target), no external packages, all math including backprop implemented by hand. Corpus is the complete works of Edgar Allan Poe (corpus/poeall.txt, ~2.4M chars, ~110 unique characters). Architecture will include the standard modern-LLM mechanisms: token embeddings, positional encoding, multi-head QKV attention with causal masking, LayerNorm, FFN with residuals — specific choices deferred. Data structures use Lisp lists / alists (no JSON). Macros reserved for genuine DSLs (model specification is the expected use), not pattern-shortcuts.
+
+Directory layout: src/ holds tensor-ops, utilities, tokenizer, model, training, inference, main. scratch/ for exploratory one-offs. corpus/ for source text. results/ split into checkpoints/, logs/, samples/.
+
+Done so far: Exploratory scripts in scratch/ for word-level and char-level corpus analysis, plus a corpus-cleanup script (decided not to use — after fixing a UTF-8/multi-byte bug in the file loader, the "cleanup" turned out to remove only 31 chars out of 2.4M, not worth it). Decision: char-level tokenization, ~110 vocab, no special tokens (no <BOS> <EOS> <PAD> <UNK>), vocab sorted by char code for reproducibility. Built src/tokenizer.lisp: defstruct vocab with size + id→char simple-vector + char→id hashtable; build-vocab, encode (returns (simple-array fixnum (*))), decode, save-vocab/load-vocab using an alist format via prin1 with *print-readably* t.
+
+Known housekeeping: load-corpus is duplicated across three scratch scripts. The correct version uses read-sequence's return value to handle multi-byte UTF-8 correctly (otherwise (make-string (file-length ...)) overallocates and trailing NULs get counted as file content). Should be factored into src/utilities.lisp when convenient.
+
+Next step: Model architecture. Decisions needed: d_model, n_layers, n_heads, context length, positional encoding scheme (learned / sinusoidal / RoPE), LayerNorm vs RMSNorm, whether to build autodiff or hand-derive gradients per op, whether to define the model via a macro-based DSL. Fresh chat is intentional here — the user wants unbiased eyes on architectural choices.
+
+Working style for Claude: Concise, no repetition, no fabricated deep insights, no reflexive agreement. Mark confidence levels and note information sources. Treat each chat as fully independent. Code style: block comments per section, inline comments for non-obvious code, "how to run" at the top of each file, one-shot scripts end with the top-level call so (load (compile-file "...")) runs everything.
