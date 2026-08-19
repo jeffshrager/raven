@@ -14,16 +14,21 @@
 ;;;;   (clean-corpus "corpus/poeall.txt" "corpus/poeall-clean.txt")
 ;;;;   (clean-corpus "corpus/poeall.txt" "corpus/poeall-clean.txt" :min-freq 10)
 
+(defun load-corpus (path)
+  "Read entire file at PATH into a single string. Uses read-sequence's
+   return value to handle the case where char count < byte count
+   (multi-byte UTF-8 makes file-length an overestimate of char count)."
+  (with-open-file (stream path :direction :input)
+    (let* ((buffer (make-string (file-length stream)))
+           (actual (read-sequence buffer stream)))
+      (subseq buffer 0 actual))))
+
 (defun clean-corpus (input-path output-path &key (min-freq 5))
   "Copy INPUT-PATH to OUTPUT-PATH, keeping only characters that appear
    at least MIN-FREQ times. NUL bytes are always dropped regardless.
    Returns an alist reporting what was removed."
-  (let ((freq (make-hash-table))
-        (text nil))
-    ;; --- Pass 1: load file and count character frequencies ---
-    (with-open-file (in input-path :direction :input)
-      (setf text (make-string (file-length in)))
-      (read-sequence text in))
+  (let ((text (load-corpus input-path))
+	(freq (make-hash-table)))
     (loop for c across text do
       (incf (gethash c freq 0)))
     ;; --- Build the keep-set: freq >= min-freq AND not NUL ---
