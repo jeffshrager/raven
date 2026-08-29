@@ -493,7 +493,7 @@
                           (setf (row-major-aref grad-wk i) (row-major-aref gwk i))))
                       (multiple-value-bind (gwv _c) (transpose-forward gwvT) (declare (ignore _c))
                         (dotimes (i (array-total-size wv))
-                          (setf (row-major-aref grad-wv i) (row-major-aref gwv i)))))))))))
+                          (setf (row-major-aref grad-wv i) (row-major-aref gwv i))))))))))
           (values grad-input
                   (list :wq grad-wq :wk grad-wk :wv grad-wv :wo grad-wo)))))))
 
