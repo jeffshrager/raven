@@ -4,36 +4,29 @@
 ;;;; type has three registered functions:
 ;;;;
 ;;;;   allocator : (config) -> params-plist
-;;;;       Given the module's config (from the DSL), allocate and initialize
-;;;;       its parameter tensors. Returns a plist like (:w #<tensor> :b ...).
-;;;;
 ;;;;   forward   : (params input context) -> (values output saved)
-;;;;       Runs the module forward. CONTEXT is a plist of things the module
-;;;;       may need beyond its own params (e.g. current sequence length,
-;;;;       causal-mask flag). SAVED is whatever the backward needs.
-;;;;
 ;;;;   backward  : (params saved grad-out) -> (values grad-input grad-params)
-;;;;       Returns gradient w.r.t. input and a plist of gradients w.r.t.
-;;;;       each parameter (same keys as params).
 ;;;;
-;;;; The registry is a hashtable from module-type keyword to a plist of
-;;;; those three functions. REGISTER-MODULE adds an entry; GET-MODULE
-;;;; retrieves one. The DSL/model layer calls into the registry — it never
-;;;; hardcodes module names.
+;;;; Registry: hashtable keyed by module-type keyword, mapping to a plist
+;;;; of (:allocator :forward :backward). Adding a new module = one file,
+;;;; one register-module call.
 ;;;;
 ;;;; Modules in this file:
 ;;;;   :embedding             token id -> vector
 ;;;;   :positional-sinusoidal add sinusoidal position encoding
-;;;;   :rmsnorm               root-mean-square normalization with learned scale
+;;;;   :rmsnorm               root-mean-square norm with learned scale
 ;;;;   :attention-block       multi-head causal self-attention
 ;;;;   :ffn                   two-layer MLP with GELU
-;;;;   :transformer-block     rmsnorm -> attention -> residual ->
-;;;;                          rmsnorm -> ffn -> residual (pre-norm variant)
-;;;;   :unembedding           final projection to vocab logits (tied option)
+;;;;   :transformer-block     pre-norm: (rmsnorm -> attn -> res) then
+;;;;                          (rmsnorm -> ffn -> res)
+;;;;   :unembedding           final projection to vocab logits
 ;;;;
-;;;; Shape convention throughout: activations are (T d_model) where T is
-;;;; the current sequence length. Batching is one sequence at a time — no
-;;;; batch dimension. Fine at this model scale.
+;;;; Shape convention throughout: activations are (T d_model). No batch
+;;;; dimension. One sequence at a time.
+;;;;
+;;;; Weight-matrix convention: W is stored as (d_in, d_out) so
+;;;; matmul-forward(input, W) works directly with no transpose. This
+;;;; applies to attention (Wq, Wk, Wv, Wo), FFN (w1, w2), and unembedding.
 ;;;;
 ;;;; How to run (from project root):
 ;;;;   (load (compile-file "src/utilities.lisp"))
@@ -49,12 +42,10 @@
   "Maps module-type keyword -> plist (:allocator :forward :backward).")
 
 (defun register-module (type &key allocator forward backward)
-  "Register a module type. TYPE is a keyword; the three fns are functions."
   (setf (gethash type *module-registry*)
         (list :allocator allocator :forward forward :backward backward)))
 
 (defun get-module (type)
-  "Return the plist for TYPE, or error if not registered."
   (or (gethash type *module-registry*)
       (error "Unknown module type: ~S" type)))
 
@@ -69,22 +60,69 @@
 
 
 ;;; ==========================================================================
+;;; Small helpers used by multiple modules
+;;; ==========================================================================
+;;;
+;;; ADD-INTO! is used wherever a residual or a multi-branch gradient
+;;; contribution has to be summed. SLICE-HEAD / SCATTER-HEAD! move a
+;;; (T, dk) slice in and out of a (T, H*dk) full-width tensor; used by
+;;; multi-head attention forward AND backward, which used to be inlined
+;;; four times each and produced a paren-thicket.
+
+(defun copy-tensor! (dest src)
+  "Elementwise copy src into dest. Same shape required."
+  (declare (type tensor dest src))
+  (dotimes (i (array-total-size dest))
+    (setf (row-major-aref dest i) (row-major-aref src i)))
+  dest)
+
+(defun add-into! (dest a b)
+  "dest[i] = a[i] + b[i]. Same shape required."
+  (declare (type tensor dest a b))
+  (dotimes (i (array-total-size dest))
+    (setf (row-major-aref dest i)
+          (+ (row-major-aref a i) (row-major-aref b i))))
+  dest)
+
+(defun slice-head (src head-idx dk)
+  "Extract head HEAD-IDX from SRC (T, H*dk). Returns fresh (T, dk).
+   Columns [head*dk : (head+1)*dk] of SRC become columns [0 : dk] of dest."
+  (declare (type tensor-2d src)
+           (type fixnum head-idx dk))
+  (let* ((t-len (array-dimension src 0))
+         (dest  (make-tensor (list t-len dk)))
+         (start (* head-idx dk)))
+    (declare (type fixnum t-len start)
+             (type tensor-2d dest))
+    (dotimes (tt t-len)
+      (dotimes (kk dk)
+        (setf (aref dest tt kk) (aref src tt (+ start kk)))))
+    dest))
+
+(defun scatter-head! (dest head-tensor head-idx dk)
+  "Copy HEAD-TENSOR (T, dk) into columns [head*dk : (head+1)*dk] of DEST."
+  (declare (type tensor-2d dest head-tensor)
+           (type fixnum head-idx dk))
+  (let ((t-len (array-dimension dest 0))
+        (start (* head-idx dk)))
+    (declare (type fixnum t-len start))
+    (dotimes (tt t-len)
+      (dotimes (kk dk)
+        (setf (aref dest tt (+ start kk)) (aref head-tensor tt kk)))))
+  dest)
+
+
+;;; ==========================================================================
 ;;; :embedding    token id -> row of learned table
 ;;; ==========================================================================
 ;;;
 ;;; Config: (:vocab-size N :d-model D)
-;;; Params: (:table (V D) tensor)
-;;; Input:  (simple-array fixnum (T))  -- token ids
-;;; Output: (T D) tensor
-;;;
-;;; Init: N(0, 1) scaled by 1/sqrt(d) is a common choice; here we use
-;;; xavier-init treating the table as a (V D) matrix. Not the "correct"
-;;; theoretical init for an embedding but works fine.
+;;; Params: (:table (V D))
+;;; Input:  (simple-array fixnum (T))
+;;; Output: (T D)
 
 (defun embedding-alloc (config)
-  (let ((v (getf config :vocab-size))
-        (d (getf config :d-model)))
-    (list :table (xavier-init v d))))
+  (list :table (xavier-init (getf config :vocab-size) (getf config :d-model))))
 
 (defun embedding-fwd (params input context)
   (declare (ignore context))
@@ -92,7 +130,7 @@
 
 (defun embedding-bwd (params saved grad-out)
   (declare (ignore params))
-  ;; No gradient w.r.t. input (ids aren't differentiable).
+  ;; IDs aren't differentiable — no grad w.r.t. input.
   (values nil (list :table (embedding-lookup-backward grad-out saved))))
 
 (register-module :embedding
@@ -106,37 +144,28 @@
 ;;; ==========================================================================
 ;;;
 ;;; Config: (:d-model D :max-len L)
-;;; Params: none (encoding is deterministic)
-;;; Input:  (T D) tensor
-;;; Output: (T D) tensor  = input + PE[:T, :]
+;;; Params: (:pe (L D)) -- treated as constant, no gradient
+;;; Input/Output: (T D)
 ;;;
 ;;; PE[pos, 2i]   = sin(pos / 10000^(2i/D))
 ;;; PE[pos, 2i+1] = cos(pos / 10000^(2i/D))
-;;;
-;;; We precompute the PE table once at allocation time (up to max-len) and
-;;; stash it in the params plist under :pe — treated as a constant, no
-;;; gradient flows to it. This is cheaper than recomputing every forward.
-;;;
-;;; Backward: grad_input = grad_out (PE is additive constant). Nothing else.
 
 (defun build-sinusoidal-pe (max-len d)
-  "Precompute the (MAX-LEN D) sinusoidal position table."
   (let ((pe (make-tensor (list max-len d))))
     (declare (type tensor-2d pe))
     (dotimes (pos max-len)
       (dotimes (i d)
-        (let* ((two-i (* 2 (floor i 2)))     ; 0,0,2,2,4,4,... (pair index)
+        (let* ((two-i (* 2 (floor i 2)))
                (freq  (expt 10000.0f0 (/ (float two-i 1.0f0)
-                                         (float d      1.0f0))))
+                                         (float d     1.0f0))))
                (angle (/ (float pos 1.0f0) freq)))
           (setf (aref pe pos i)
                 (if (evenp i) (sin angle) (cos angle))))))
     pe))
 
 (defun positional-sinusoidal-alloc (config)
-  (let ((d (getf config :d-model))
-        (l (getf config :max-len)))
-    (list :pe (build-sinusoidal-pe l d))))
+  (list :pe (build-sinusoidal-pe (getf config :max-len)
+                                 (getf config :d-model))))
 
 (defun positional-sinusoidal-fwd (params input context)
   (declare (ignore context))
@@ -153,11 +182,8 @@
 
 (defun positional-sinusoidal-bwd (params saved grad-out)
   (declare (ignore params saved))
-  ;; grad_input = grad_out (fresh copy — caller convention).
-  (let ((gi (tensor-like grad-out)))
-    (dotimes (i (array-total-size grad-out))
-      (setf (row-major-aref gi i) (row-major-aref grad-out i)))
-    (values gi nil)))
+  ;; PE is additive constant: grad passes through unchanged.
+  (values (copy-tensor! (tensor-like grad-out) grad-out) nil))
 
 (register-module :positional-sinusoidal
                  :allocator #'positional-sinusoidal-alloc
@@ -170,34 +196,22 @@
 ;;; ==========================================================================
 ;;;
 ;;; Config: (:d-model D :eps 1e-5)
-;;; Params: (:gamma (D) tensor, ones-initialized)
-;;; Input:  (T D)
-;;; Output: (T D)
+;;; Params: (:gamma (D)) ones-initialized
 ;;;
-;;; rms(x[t,:]) = sqrt(mean(x[t,:]^2) + eps)
+;;; Per-row: ms  = mean(x^2) + eps
+;;;          rms = sqrt(ms)
+;;;          inv = 1/rms
+;;;          y[k] = x[k] * inv * gamma[k]
 ;;;
-;;; Backward for one row (dropping the t subscript):
-;;;   let ms  = mean(x^2) + eps
-;;;   let rms = sqrt(ms)
-;;;   let inv = 1 / rms
-;;;   y[k]    = x[k] * inv * gamma[k]
-;;;
-;;;   d y[k] / d x[j] = gamma[k] * (delta_kj * inv + x[k] * d inv / d x[j])
-;;;   d inv / d x[j]  = -0.5 * ms^(-3/2) * (2 x[j] / D)
-;;;                   = -x[j] / (D * ms * rms) = -x[j] * inv / (D * ms)
-;;;
-;;;   grad_x[j] = sum_k grad_out[k] * gamma[k] * (delta_kj * inv - x[k] * x[j] * inv / (D * ms))
-;;;             = inv * (grad_out[j] * gamma[j]
-;;;                      - x[j] / (D * ms) * sum_k grad_out[k] * gamma[k] * x[k])
-;;;
-;;;   grad_gamma[k] += grad_out[k] * x[k] * inv     (summed across all rows)
-;;;
-;;; Save: (x inv-per-row ms-per-row) so we don't recompute in backward.
+;;; Backward (per row):
+;;;   s = sum_k grad_out[k] * gamma[k] * x[k]
+;;;   grad_x[j] = inv * grad_out[j] * gamma[j]  -  x[j] * s / (D * ms * rms)
+;;;             = inv * grad_out[j] * gamma[j]  -  x[j] * inv * s / (D * ms)
+;;;   grad_gamma[k] += grad_out[k] * x[k] * inv    (summed across rows)
 
 (defun rmsnorm-alloc (config)
-  (let ((d (getf config :d-model)))
-    (list :gamma (ones (list d))
-          :eps   (coerce (or (getf config :eps) 1.0f-5) 'single-float))))
+  (list :gamma (ones (list (getf config :d-model)))
+        :eps   (coerce (or (getf config :eps) 1.0f-5) 'single-float)))
 
 (defun rmsnorm-fwd (params input context)
   (declare (ignore context))
@@ -244,7 +258,6 @@
       (dotimes (tt t-len)
         (let* ((inv (aref invs tt))
                (ms  (aref mss  tt))
-               ;; s = sum_k grad_out[k] * gamma[k] * x[k]
                (s   0.0f0))
           (declare (type single-float inv ms s))
           (dotimes (k d)
@@ -255,7 +268,6 @@
               (setf (aref grad-input tt j)
                     (- (* inv (aref grad-out tt j) (aref gamma j))
                        (* coef (aref input tt j))))))
-          ;; accumulate grad_gamma
           (dotimes (k d)
             (incf (aref grad-gamma k)
                   (* (aref grad-out tt k) (aref input tt k) inv)))))
@@ -271,32 +283,19 @@
 ;;; :attention-block    multi-head causal self-attention
 ;;; ==========================================================================
 ;;;
-;;; Config: (:d-model D :n-heads H)   -- D must be divisible by H
-;;; Params: (:wq (D D) :wk (D D) :wv (D D) :wo (D D))
-;;;         (Biases omitted; modern LLMs typically drop attention biases.)
-;;; Input:  (T D)
-;;; Output: (T D)
+;;; Config: (:d-model D :n-heads H)     D must be divisible by H
+;;; Params: (:wq (D D) :wk (D D) :wv (D D) :wo (D D) :n-heads H)
+;;;         (No biases — modern LLM default.)
+;;; Input/Output: (T D)
 ;;;
-;;; Steps for each head h (dk = D / H):
-;;;   1. Project: Q_h = X . Wq_h,  K_h = X . Wk_h,  V_h = X . Wv_h
-;;;      (Wq_h is columns [h*dk : (h+1)*dk] of Wq; we slice on the fly.)
-;;;   2. Scores: S_h = Q_h . K_h^T  * (1/sqrt(dk))
-;;;   3. Causal mask: S_h[i,j] = -inf for j > i
-;;;   4. Softmax rows: A_h = softmax(S_h)
-;;;   5. Weighted V: Z_h = A_h . V_h              shape (T dk)
-;;; Concat heads across the D axis -> Z (T D)
-;;; Output: Y = Z . Wo
-;;;
-;;; This is written as a monolithic forward/backward for clarity. Speed
-;;; optimizations (batched matmul across heads, fused ops) are deferred.
-;;;
-;;; The backward derivation is standard multi-head attention backprop.
-;;; See e.g. https://arxiv.org/abs/1706.03762 for forward; backward is
-;;; the routine chain-rule composition through matmul + softmax.
-;;;
-;;; NOTE: implementation is fairly long. Kept in one function to keep
-;;; the derivation traceable end-to-end. Consider factoring per-head into
-;;; a helper later if it stays stable.
+;;; Per head h (dk = D/H):
+;;;   Slice Qh, Kh, Vh out of full Q=X.Wq, K=X.Wk, V=X.Wv  (each (T, dk))
+;;;   S  = Qh . Kh^T * (1/sqrt(dk))               (T, T)
+;;;   S[i,j] = -inf for j>i                       causal mask
+;;;   A  = softmax(S) row-wise                    (T, T)
+;;;   Zh = A . Vh                                 (T, dk)
+;;; Scatter Zh back into full Z (T, D).
+;;; Y = Z . Wo                                    (T, D)
 
 (defun attention-alloc (config)
   (let ((d (getf config :d-model))
@@ -318,67 +317,41 @@
          (t-len (array-dimension input 0))
          (d     (array-dimension input 1))
          (dk    (floor d h))
-         (scale-factor (/ 1.0f0 (sqrt (float dk 1.0f0)))))
-    (declare (type tensor-2d input wq wk wv wo)
+         (scale-factor (/ 1.0f0 (sqrt (float dk 1.0f0))))
+         ;; Project full-width Q, K, V once (no transpose needed thanks to
+         ;; (d_in, d_out) storage convention).
+         (q (nth-value 0 (matmul-forward input wq)))
+         (k (nth-value 0 (matmul-forward input wk)))
+         (v (nth-value 0 (matmul-forward input wv)))
+         (z (make-tensor (list t-len d)))
+         (attn-all (make-array h)))
+    (declare (type tensor-2d input wq wk wv wo q k v z)
              (type fixnum t-len d dk h)
              (type single-float scale-factor))
-    ;; Project Q, K, V by full-width matmul (T,D) @ (D,D) = (T,D).
-    ;; NOTE: our matmul is y = A . B with A=(M,K), B=(K,N). Here A=input
-    ;; (T,D), B=W (D,D), result (T,D). But WQ is stored as (D,D) with the
-    ;; XAVIER-INIT convention (fan_out, fan_in) = (out_dim, in_dim). We
-    ;; want out = in . W, treating W's first axis as input dim. So we
-    ;; transpose W first. (Alternative: store W as (in,out) from the
-    ;; start. Choosing transpose here to keep xavier-init's convention.)
-    (multiple-value-bind (wqT _1) (transpose-forward wq) (declare (ignore _1))
-      (multiple-value-bind (wkT _2) (transpose-forward wk) (declare (ignore _2))
-        (multiple-value-bind (wvT _3) (transpose-forward wv) (declare (ignore _3))
-          (multiple-value-bind (woT _4) (transpose-forward wo) (declare (ignore _4))
-            (multiple-value-bind (q _q) (matmul-forward input wqT) (declare (ignore _q))
-              (multiple-value-bind (k _k) (matmul-forward input wkT) (declare (ignore _k))
-                (multiple-value-bind (v _v) (matmul-forward input wvT) (declare (ignore _v))
-                  (declare (type tensor-2d q k v))
-                  ;; Allocate output Z and per-head attention weights (for backward).
-                  (let ((z          (make-tensor (list t-len d)))
-                        (attn-all   (make-array h)))   ; vector of (T,T) tensors
-                    (declare (type tensor-2d z))
-                    (dotimes (hi h)
-                      (let ((qh (make-tensor (list t-len dk)))
-                            (kh (make-tensor (list t-len dk)))
-                            (vh (make-tensor (list t-len dk))))
-                        (declare (type tensor-2d qh kh vh))
-                        ;; Slice head hi out of Q, K, V (columns [hi*dk : (hi+1)*dk]).
-                        (dotimes (tt t-len)
-                          (dotimes (kk dk)
-                            (setf (aref qh tt kk) (aref q tt (+ (* hi dk) kk)))
-                            (setf (aref kh tt kk) (aref k tt (+ (* hi dk) kk)))
-                            (setf (aref vh tt kk) (aref v tt (+ (* hi dk) kk)))))
-                        ;; Scores S = Q . K^T, then scale, then causal mask.
-                        (multiple-value-bind (khT _kt) (transpose-forward kh) (declare (ignore _kt))
-                          (multiple-value-bind (s _s) (matmul-forward qh khT) (declare (ignore _s))
-                            (declare (type tensor-2d s))
-                            (dotimes (i t-len)
-                              (dotimes (j t-len)
-                                (setf (aref s i j)
-                                      (if (> j i)
-                                          most-negative-single-float
-                                          (* scale-factor (aref s i j))))))
-                            (multiple-value-bind (a _a) (softmax-forward s) (declare (ignore _a))
-                              (declare (type tensor-2d a))
-                              (setf (aref attn-all hi) a)
-                              ;; Zh = A . Vh, (T,T) @ (T,dk) = (T,dk)
-                              (multiple-value-bind (zh _z) (matmul-forward a vh) (declare (ignore _z))
-                                (declare (type tensor-2d zh))
-                                (dotimes (tt t-len)
-                                  (dotimes (kk dk)
-                                    (setf (aref z tt (+ (* hi dk) kk))
-                                          (aref zh tt kk))))))))))
-                    ;; Y = Z . Wo^T
-                    (multiple-value-bind (y _y) (matmul-forward z woT) (declare (ignore _y))
-                      ;; SAVED bundles everything backward needs.
-                      (values y (list :input input :q q :k k :v v :z z
-                                      :attn attn-all
-                                      :wq wq :wk wk :wv wv :wo wo
-                                      :h h :dk dk :scale scale-factor)))))))))))))
+    (dotimes (hi h)
+      (let* ((qh  (slice-head q hi dk))
+             (kh  (slice-head k hi dk))
+             (vh  (slice-head v hi dk))
+             (khT (nth-value 0 (transpose-forward kh)))
+             (s   (nth-value 0 (matmul-forward qh khT))))
+        (declare (type tensor-2d qh kh vh khT s))
+        ;; Scale and causal-mask in a single pass over S.
+        (dotimes (i t-len)
+          (dotimes (j t-len)
+            (setf (aref s i j)
+                  (if (> j i)
+                      most-negative-single-float
+                      (* scale-factor (aref s i j))))))
+        (let* ((a  (nth-value 0 (softmax-forward s)))
+               (zh (nth-value 0 (matmul-forward a vh))))
+          (declare (type tensor-2d a zh))
+          (setf (aref attn-all hi) a)
+          (scatter-head! z zh hi dk))))
+    (values (nth-value 0 (matmul-forward z wo))
+            (list :input input :q q :k k :v v :z z
+                  :attn attn-all
+                  :wq wq :wk wk :wv wv :wo wo
+                  :h h :dk dk :scale scale-factor))))
 
 (defun attention-bwd (params saved grad-out)
   (declare (ignore params))
@@ -397,105 +370,64 @@
          (scale-factor (getf saved :scale))
          (t-len (array-dimension input 0))
          (d     (array-dimension input 1))
-         (grad-input (tensor-like input))
-         (grad-wq (tensor-like wq))
-         (grad-wk (tensor-like wk))
-         (grad-wv (tensor-like wv))
-         (grad-wo (tensor-like wo)))
-    (declare (type tensor-2d input q k v z wq wk wv wo grad-input grad-wq grad-wk grad-wv grad-wo grad-out)
+         (grad-q (make-tensor (list t-len d)))
+         (grad-k (make-tensor (list t-len d)))
+         (grad-v (make-tensor (list t-len d))))
+    (declare (type tensor-2d input q k v z wq wk wv wo grad-q grad-k grad-v grad-out)
              (type fixnum t-len d dk h)
              (type single-float scale-factor))
-    ;; Reverse of: y = z . wo^T
-    ;;   grad_z  = grad_y . wo         (grad_y is grad-out)
-    ;;   grad_wo = grad_y^T . z, then transposed back  (see below)
-    ;; We used wo^T in forward, so gradient w.r.t. wo^T is (grad_y^T . z)^T = z^T . grad_y.
-    ;; Equivalently grad_wo = (grad_y^T . z) transposed, but easier: use
-    ;; matmul-backward on the (z, wo^T) pair.
-    (multiple-value-bind (woT _wot) (transpose-forward wo) (declare (ignore _wot))
-      (multiple-value-bind (grad-z grad-woT)
-          (matmul-backward grad-out (list z woT))
-        (declare (type tensor-2d grad-z grad-woT))
-        ;; grad-wo = transpose(grad-woT)
-        (multiple-value-bind (gwo _tw) (transpose-forward grad-woT) (declare (ignore _tw))
-          (dotimes (i (array-total-size wo))
-            (setf (row-major-aref grad-wo i) (row-major-aref gwo i))))
-        ;; Prepare accumulators for grad-Q, grad-K, grad-V (full width).
-        (let ((grad-q (make-tensor (list t-len d)))
-              (grad-k (make-tensor (list t-len d)))
-              (grad-v (make-tensor (list t-len d))))
-          (declare (type tensor-2d grad-q grad-k grad-v))
-          (dotimes (hi h)
-            (let ((qh (make-tensor (list t-len dk)))
-                  (kh (make-tensor (list t-len dk)))
-                  (vh (make-tensor (list t-len dk)))
-                  (grad-zh (make-tensor (list t-len dk)))
-                  (a  (aref attn hi)))
-              (declare (type tensor-2d qh kh vh grad-zh a))
-              ;; Slice heads and slice grad-z.
-              (dotimes (tt t-len)
-                (dotimes (kk dk)
-                  (setf (aref qh tt kk) (aref q tt (+ (* hi dk) kk)))
-                  (setf (aref kh tt kk) (aref k tt (+ (* hi dk) kk)))
-                  (setf (aref vh tt kk) (aref v tt (+ (* hi dk) kk)))
-                  (setf (aref grad-zh tt kk) (aref grad-z tt (+ (* hi dk) kk)))))
-              ;; Zh = A . Vh; backward:
-              (multiple-value-bind (grad-a grad-vh)
-                  (matmul-backward grad-zh (list a vh))
-                (declare (type tensor-2d grad-a grad-vh))
-                ;; A = softmax(S_masked); backward:
-                (let ((grad-s (softmax-backward grad-a a)))
-                  (declare (type tensor-2d grad-s))
-                  ;; Masked positions had -inf -> softmax=0 -> grad passes as 0 there
-                  ;; already because A[i,j]=0 for masked j; but we also want to
-                  ;; not push gradient into future positions. Zero them explicitly.
-                  (dotimes (i t-len)
-                    (dotimes (j t-len)
-                      (when (> j i)
-                        (setf (aref grad-s i j) 0.0f0))))
-                  ;; S = scale * Qh . Kh^T; backward:
-                  ;;   grad_qh_khT_result = scale * grad_s (chain through scale)
-                  (dotimes (i (array-total-size grad-s))
-                    (setf (row-major-aref grad-s i)
-                          (* scale-factor (row-major-aref grad-s i))))
-                  (multiple-value-bind (khT _kt) (transpose-forward kh) (declare (ignore _kt))
-                    (multiple-value-bind (grad-qh grad-khT)
-                        (matmul-backward grad-s (list qh khT))
-                      (declare (type tensor-2d grad-qh grad-khT))
-                      (multiple-value-bind (grad-kh _t2) (transpose-forward grad-khT) (declare (ignore _t2))
-                        (declare (type tensor-2d grad-kh))
-                        ;; Scatter head gradients back into the full (T,D) tensors.
-                        (dotimes (tt t-len)
-                          (dotimes (kk dk)
-                            (setf (aref grad-q tt (+ (* hi dk) kk)) (aref grad-qh tt kk))
-                            (setf (aref grad-k tt (+ (* hi dk) kk)) (aref grad-kh tt kk))
-                            (setf (aref grad-v tt (+ (* hi dk) kk)) (aref grad-vh tt kk)))))))))))
-          ;; Now propagate grad-Q, grad-K, grad-V back through their projections.
-          ;; Forward was: Q = input . Wq^T, etc.
-          (multiple-value-bind (wqT _1) (transpose-forward wq) (declare (ignore _1))
-            (multiple-value-bind (wkT _2) (transpose-forward wk) (declare (ignore _2))
-              (multiple-value-bind (wvT _3) (transpose-forward wv) (declare (ignore _3))
-                (multiple-value-bind (gi-q gwqT) (matmul-backward grad-q (list input wqT))
-                  (multiple-value-bind (gi-k gwkT) (matmul-backward grad-k (list input wkT))
-                    (multiple-value-bind (gi-v gwvT) (matmul-backward grad-v (list input wvT))
-                      (declare (type tensor-2d gi-q gi-k gi-v gwqT gwkT gwvT))
-                      ;; grad_input = sum of three input-gradient contributions
-                      (dotimes (i (array-total-size input))
-                        (setf (row-major-aref grad-input i)
-                              (+ (row-major-aref gi-q i)
-                                 (row-major-aref gi-k i)
-                                 (row-major-aref gi-v i))))
-                      ;; grad_wq = transpose(gwqT), etc.
-                      (multiple-value-bind (gwq _a) (transpose-forward gwqT) (declare (ignore _a))
-                        (dotimes (i (array-total-size wq))
-                          (setf (row-major-aref grad-wq i) (row-major-aref gwq i))))
-                      (multiple-value-bind (gwk _b) (transpose-forward gwkT) (declare (ignore _b))
-                        (dotimes (i (array-total-size wk))
-                          (setf (row-major-aref grad-wk i) (row-major-aref gwk i))))
-                      (multiple-value-bind (gwv _c) (transpose-forward gwvT) (declare (ignore _c))
-                        (dotimes (i (array-total-size wv))
-                          (setf (row-major-aref grad-wv i) (row-major-aref gwv i))))))))))
-          (values grad-input
-                  (list :wq grad-wq :wk grad-wk :wv grad-wv :wo grad-wo)))))))
+    ;; Y = Z . Wo  ->  grad_z, grad_wo
+    (multiple-value-bind (grad-z grad-wo)
+        (matmul-backward grad-out (list z wo))
+      (declare (type tensor-2d grad-z grad-wo))
+      ;; Per-head backward.
+      (dotimes (hi h)
+        (let* ((qh      (slice-head q hi dk))
+               (kh      (slice-head k hi dk))
+               (vh      (slice-head v hi dk))
+               (grad-zh (slice-head grad-z hi dk))
+               (a       (aref attn hi))
+               (khT     (nth-value 0 (transpose-forward kh))))
+          (declare (type tensor-2d qh kh vh grad-zh a khT))
+          ;; Zh = A . Vh  ->  grad_a, grad_vh
+          (multiple-value-bind (grad-a grad-vh)
+              (matmul-backward grad-zh (list a vh))
+            (declare (type tensor-2d grad-a grad-vh))
+            ;; A = softmax(masked S)  ->  grad_s (before mask/scale)
+            (let ((grad-s (softmax-backward grad-a a)))
+              (declare (type tensor-2d grad-s))
+              ;; Zero masked positions and apply scale factor in one pass.
+              (dotimes (i t-len)
+                (dotimes (j t-len)
+                  (if (> j i)
+                      (setf (aref grad-s i j) 0.0f0)
+                      (setf (aref grad-s i j)
+                            (* scale-factor (aref grad-s i j))))))
+              ;; S = Qh . Kh^T  ->  grad_qh, grad_khT
+              (multiple-value-bind (grad-qh grad-khT)
+                  (matmul-backward grad-s (list qh khT))
+                (declare (type tensor-2d grad-qh grad-khT))
+                (let ((grad-kh (nth-value 0 (transpose-forward grad-khT))))
+                  (declare (type tensor-2d grad-kh))
+                  (scatter-head! grad-q grad-qh hi dk)
+                  (scatter-head! grad-k grad-kh hi dk)
+                  (scatter-head! grad-v grad-vh hi dk)))))))
+      ;; Project grad-Q, grad-K, grad-V back through their input projections.
+      ;; Forward: Q = input . wq (etc.); no transpose in storage.
+      (multiple-value-bind (gi-q grad-wq) (matmul-backward grad-q (list input wq))
+        (multiple-value-bind (gi-k grad-wk) (matmul-backward grad-k (list input wk))
+          (multiple-value-bind (gi-v grad-wv) (matmul-backward grad-v (list input wv))
+            (declare (type tensor-2d gi-q gi-k gi-v grad-wq grad-wk grad-wv))
+            (let ((grad-input (tensor-like input)))
+              (declare (type tensor-2d grad-input))
+              ;; grad_input = gi_q + gi_k + gi_v
+              (dotimes (i (array-total-size input))
+                (setf (row-major-aref grad-input i)
+                      (+ (row-major-aref gi-q i)
+                         (row-major-aref gi-k i)
+                         (row-major-aref gi-v i))))
+              (values grad-input
+                      (list :wq grad-wq :wk grad-wk :wv grad-wv :wo grad-wo)))))))))
 
 (register-module :attention-block
                  :allocator #'attention-alloc
@@ -507,67 +439,57 @@
 ;;; :ffn    two-layer MLP with GELU activation
 ;;; ==========================================================================
 ;;;
-;;; Config: (:d-model D :d-ff F)   where F is usually 4*D
+;;; Config: (:d-model D :d-ff F)   F usually 4*D
 ;;; Params: (:w1 (D F) :b1 (F) :w2 (F D) :b2 (D))
-;;; Input:  (T D)
-;;; Output: (T D)
 ;;;
-;;;   h1 = input . w1 + b1        (T F)
-;;;   h2 = gelu(h1)               (T F)
-;;;   y  = h2 . w2 + b2           (T D)
+;;;   h1a = input . w1               (T F)
+;;;   h1  = h1a + b1                 (T F)
+;;;   h2  = gelu(h1)                 (T F)
+;;;   h3  = h2 . w2                  (T D)
+;;;   y   = h3 + b2                  (T D)
 ;;;
-;;; Convention note: unlike attention (where we stored W as (out,in) and
-;;; transposed on use), here w1 and w2 are stored as (in,out) to match
-;;; the matmul call sites directly. Xavier-init still takes (fan_out,
-;;; fan_in) — so we call it with args flipped and get a matrix of shape
-;;; (in, out).
+;;; Save only what the backward needs: input, h2 (for grad_w2), gelu-saved
+;;; (for gelu-backward), and the weight matrices w1, w2 (matmul-backward
+;;; needs them). The intermediate activations h1a, h1, h3 are not needed.
 
 (defun ffn-alloc (config)
   (let ((d (getf config :d-model))
         (f (or (getf config :d-ff) (* 4 (getf config :d-model)))))
-    ;; xavier-init returns (fan-out fan-in); we want (fan-in fan-out),
-    ;; so call with (fan-in fan-out) args to get shape (fan-in fan-out).
-    ;; That's a swap: xavier-init D F -> (D F).
-    (list :w1 (xavier-init d f)      ; shape (D F)
+    (list :w1 (xavier-init d f)      ; (D F) under (in, out) convention
           :b1 (zeros (list f))
-          :w2 (xavier-init f d)      ; shape (F D)
+          :w2 (xavier-init f d)      ; (F D)
           :b2 (zeros (list d)))))
 
 (defun ffn-fwd (params input context)
   (declare (ignore context))
-  (let ((w1 (getf params :w1))
-        (b1 (getf params :b1))
-        (w2 (getf params :w2))
-        (b2 (getf params :b2)))
-    (multiple-value-bind (h1a _1) (matmul-forward input w1) (declare (ignore _1))
-      (multiple-value-bind (h1 _2) (add-bias-forward h1a b1) (declare (ignore _2))
-        (multiple-value-bind (h2 gelu-saved) (gelu-forward h1)
-          (multiple-value-bind (h3 _3) (matmul-forward h2 w2) (declare (ignore _3))
-            (multiple-value-bind (y _4) (add-bias-forward h3 b2) (declare (ignore _4))
-              (values y (list :input input :h1a h1a :h1 h1 :h2 h2 :h3 h3
-                              :w1 w1 :w2 w2 :gelu-saved gelu-saved)))))))))
+  (let* ((w1 (getf params :w1))
+         (b1 (getf params :b1))
+         (w2 (getf params :w2))
+         (b2 (getf params :b2))
+         (h1a (nth-value 0 (matmul-forward input w1)))
+         (h1  (nth-value 0 (add-bias-forward h1a b1))))
+    (multiple-value-bind (h2 gelu-saved) (gelu-forward h1)
+      (let* ((h3 (nth-value 0 (matmul-forward h2 w2)))
+             (y  (nth-value 0 (add-bias-forward h3 b2))))
+        (values y (list :input input :h2 h2
+                        :w1 w1 :w2 w2 :gelu-saved gelu-saved))))))
 
 (defun ffn-bwd (params saved grad-out)
   (declare (ignore params))
   (let ((input (getf saved :input))
-        (h1a   (getf saved :h1a))
-        (h1    (getf saved :h1))
         (h2    (getf saved :h2))
-        (h3    (getf saved :h3))
         (w1    (getf saved :w1))
         (w2    (getf saved :w2))
         (gs    (getf saved :gelu-saved)))
-    ;; y = h3 + b2  ->  grad_h3, grad_b2
+    ;; y = h3 + b2 -> grad_h3, grad_b2
     (multiple-value-bind (grad-h3 grad-b2) (add-bias-backward grad-out nil)
-      (declare (ignore))
-      ;; h3 = h2 . w2  ->  grad_h2, grad_w2
+      ;; h3 = h2 . w2 -> grad_h2, grad_w2
       (multiple-value-bind (grad-h2 grad-w2) (matmul-backward grad-h3 (list h2 w2))
         ;; h2 = gelu(h1) -> grad_h1
         (let ((grad-h1 (gelu-backward grad-h2 gs)))
           ;; h1 = h1a + b1 -> grad_h1a, grad_b1
           (multiple-value-bind (grad-h1a grad-b1) (add-bias-backward grad-h1 nil)
-            (declare (ignore))
-            ;; h1a = input . w1  ->  grad_input, grad_w1
+            ;; h1a = input . w1 -> grad_input, grad_w1
             (multiple-value-bind (grad-input grad-w1)
                 (matmul-backward grad-h1a (list input w1))
               (values grad-input
@@ -585,20 +507,17 @@
 ;;; ==========================================================================
 ;;;
 ;;; Config: (:d-model D :n-heads H :d-ff F :eps E)
-;;; Params: (:norm1 <rmsnorm params> :attn <attention params>
+;;; Params: (:norm1 <rmsnorm params> :attn <attn params>
 ;;;          :norm2 <rmsnorm params> :ffn  <ffn params>)
 ;;;
 ;;; Forward (pre-norm):
 ;;;   a  = attention(rmsnorm(x))
-;;;   x1 = x + a               (residual)
+;;;   x1 = x + a               residual
 ;;;   f  = ffn(rmsnorm(x1))
-;;;   y  = x1 + f              (residual)
+;;;   y  = x1 + f              residual
 ;;;
-;;; Pre-norm (normalize before sublayer, add residual after) is what modern
-;;; LLMs use — it trains more stably at depth than post-norm.
-;;;
-;;; Backward: reverse the composition. Residual adds mean grad flows through
-;;; both branches unchanged.
+;;; Backward: reverse composition; residuals mean grad flows into both
+;;; branches of each add — accumulate with ADD-INTO!.
 
 (defun transformer-block-alloc (config)
   (list :norm1 (module-alloc :rmsnorm         config)
@@ -607,51 +526,38 @@
         :ffn   (module-alloc :ffn             config)))
 
 (defun transformer-block-fwd (params input context)
-  (multiple-value-bind (n1  sn1) (module-forward :rmsnorm         (getf params :norm1) input context)
-    (multiple-value-bind (a   sa)  (module-forward :attention-block (getf params :attn)  n1 context)
-      ;; x1 = input + a
-      (multiple-value-bind (x1 sadd1) (add-forward input a)
-        (declare (ignore sadd1))
+  (multiple-value-bind (n1 sn1) (module-forward :rmsnorm (getf params :norm1) input context)
+    (multiple-value-bind (a sa)  (module-forward :attention-block (getf params :attn) n1 context)
+      (let ((x1 (nth-value 0 (add-forward input a))))
         (multiple-value-bind (n2 sn2) (module-forward :rmsnorm (getf params :norm2) x1 context)
           (multiple-value-bind (f sf) (module-forward :ffn (getf params :ffn) n2 context)
-            (multiple-value-bind (y sadd2) (add-forward x1 f)
-              (declare (ignore sadd2))
-              (values y (list :sn1 sn1 :sa sa :sn2 sn2 :sf sf
-                              :x1 x1)))))))))
+            (let ((y (nth-value 0 (add-forward x1 f))))
+              (values y (list :sn1 sn1 :sa sa :sn2 sn2 :sf sf)))))))))
 
 (defun transformer-block-bwd (params saved grad-out)
   (let ((sn1 (getf saved :sn1))
         (sa  (getf saved :sa))
         (sn2 (getf saved :sn2))
         (sf  (getf saved :sf)))
-    ;; y = x1 + f  ->  grad_x1_a, grad_f = grad_out both
+    ;; y = x1 + f  ->  grad_x1_a, grad_f
     (multiple-value-bind (grad-x1-a grad-f) (add-backward grad-out nil)
-      ;; f = ffn(n2) -> grad_n2, grad_ffn_params
+      ;; f = ffn(n2) -> grad_n2, grad_ffn
       (multiple-value-bind (grad-n2 grad-ffn) (module-backward :ffn (getf params :ffn) sf grad-f)
-        ;; n2 = rmsnorm(x1) -> grad_x1_b, grad_norm2_params
-        (multiple-value-bind (grad-x1-b grad-n2p) (module-backward :rmsnorm (getf params :norm2) sn2 grad-n2)
-          ;; grad_x1 total = grad_x1_a + grad_x1_b
-          (let ((grad-x1 (tensor-like grad-x1-a)))
-            (dotimes (i (array-total-size grad-x1))
-              (setf (row-major-aref grad-x1 i)
-                    (+ (row-major-aref grad-x1-a i)
-                       (row-major-aref grad-x1-b i))))
-            ;; x1 = input + a -> grad_input_a, grad_a
+        ;; n2 = rmsnorm(x1) -> grad_x1_b, grad_norm2
+        (multiple-value-bind (grad-x1-b grad-norm2) (module-backward :rmsnorm (getf params :norm2) sn2 grad-n2)
+          ;; grad_x1 = grad_x1_a + grad_x1_b
+          (let ((grad-x1 (add-into! (tensor-like grad-x1-a) grad-x1-a grad-x1-b)))
+            ;; x1 = input + a  ->  grad_input_a, grad_a
             (multiple-value-bind (grad-input-a grad-a) (add-backward grad-x1 nil)
-              ;; a = attention(n1) -> grad_n1, grad_attn_params
+              ;; a = attention(n1) -> grad_n1, grad_attn
               (multiple-value-bind (grad-n1 grad-attn) (module-backward :attention-block (getf params :attn) sa grad-a)
-                ;; n1 = rmsnorm(input) -> grad_input_b, grad_norm1_params
-                (multiple-value-bind (grad-input-b grad-n1p) (module-backward :rmsnorm (getf params :norm1) sn1 grad-n1)
-                  (let ((grad-input (tensor-like grad-input-a)))
-                    (dotimes (i (array-total-size grad-input))
-                      (setf (row-major-aref grad-input i)
-                            (+ (row-major-aref grad-input-a i)
-                               (row-major-aref grad-input-b i))))
-                    (values grad-input
-                            (list :norm1 grad-n1p
-                                  :attn  grad-attn
-                                  :norm2 grad-n2p
-                                  :ffn   grad-ffn))))))))))))
+                ;; n1 = rmsnorm(input) -> grad_input_b, grad_norm1
+                (multiple-value-bind (grad-input-b grad-norm1) (module-backward :rmsnorm (getf params :norm1) sn1 grad-n1)
+                  (values (add-into! (tensor-like grad-input-a) grad-input-a grad-input-b)
+                          (list :norm1 grad-norm1
+                                :attn  grad-attn
+                                :norm2 grad-norm2
+                                :ffn   grad-ffn)))))))))))
 
 (register-module :transformer-block
                  :allocator #'transformer-block-alloc
@@ -663,33 +569,21 @@
 ;;; :unembedding    project (T D) -> (T V) logits
 ;;; ==========================================================================
 ;;;
-;;; Config: (:d-model D :vocab-size V :tied nil-or-embedding-table)
-;;; Params: (:w (D V))  -- or empty if tied
-;;; Input:  (T D)
-;;; Output: (T V) logits (no softmax; loss layer handles that)
+;;; Config: (:d-model D :vocab-size V)
+;;; Params: (:w (D V))
 ;;;
-;;; Weight tying: modern LLMs often share the embedding table with the
-;;; unembedding projection. Since embedding is (V D) and unembedding wants
-;;; (D V), tying means unembedding uses the embedding table transposed.
-;;; If :tied is a tensor, we use it directly (as (V D)) and transpose at
-;;; forward time. If :tied is NIL, we allocate our own (D V) weight.
-;;;
-;;; For now: no tying — allocate own weight. Add tying later if desired
-;;; (requires a way for two modules to share a param, which the DSL layer
-;;; will need to support).
+;;; No softmax here — loss layer handles it fused for numerical stability.
 
 (defun unembedding-alloc (config)
-  (let ((d (getf config :d-model))
-        (v (getf config :vocab-size)))
-    (list :w (xavier-init d v))))    ; shape (D V)
+  (list :w (xavier-init (getf config :d-model) (getf config :vocab-size))))
 
 (defun unembedding-fwd (params input context)
   (declare (ignore context))
   (matmul-forward input (getf params :w)))
 
 (defun unembedding-bwd (params saved grad-out)
+  (declare (ignore params))
   (multiple-value-bind (grad-input grad-w) (matmul-backward grad-out saved)
-    (declare (ignore params))
     (values grad-input (list :w grad-w))))
 
 (register-module :unembedding
