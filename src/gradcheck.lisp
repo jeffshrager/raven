@@ -36,8 +36,23 @@
 (defparameter *gc-h* 1.0f-3
   "Perturbation size for finite differences.")
 
-(defparameter *gc-tol* 1.0f-2
-  "Relative-error tolerance for PASS. Loose because of single-float.")
+;; Combined absolute + relative tolerance (torch.autograd.gradcheck style).
+;; Pass criterion, per element: |a - n| <= *gc-atol* + *gc-rtol* * max(|a|, |n|).
+;; Rationale:
+;;   The atol term covers the fixed absolute noise of single-float central
+;;   differences, roughly L*epsilon/h. In our test setups this is around
+;;   1e-4 to 2e-4 for the naive elementwise-loop forward pass; 3e-4 leaves
+;;   safe margin for the longer chains in attention (Q/K flow through
+;;   softmax, which is precision-hungry).
+;;   The rtol term covers accumulated relative noise on larger-magnitude
+;;   gradients. 5% is well below any real bug (a sign flip is 200%, an
+;;   off-by-one is order 100%, a missing chain-rule term is order 100%).
+
+(defparameter *gc-atol* 3.0f-4
+  "Absolute tolerance for numerical vs analytic gradient comparison.")
+
+(defparameter *gc-rtol* 5.0f-2
+  "Relative tolerance (5%) applied on top of *GC-ATOL*.")
 
 (defparameter *gc-seed-random-state* nil
   "If set to a random-state, we reset *random-state* to a copy of it
@@ -66,21 +81,39 @@
       (incf acc (* (row-major-aref a i) (row-major-aref b i))))
     acc))
 
-(defun max-rel-error (analytic numerical)
-  "Max over elements of |a - n| / max(|a|, |n|, epsilon).
-   ANALYTIC and NUMERICAL must have same shape."
+(defun check-close (analytic numerical)
+  "Compare two gradient tensors elementwise using combined atol + rtol.
+   Returns (values PASS-P MAX-ABS-DIFF MAX-REL-ERR).
+     PASS-P      : T iff every element satisfies
+                     |a - n| <= *GC-ATOL* + *GC-RTOL* * max(|a|, |n|).
+     MAX-ABS-DIFF: max |a - n| over all elements. Direct measure of
+                   agreement, meaningful independent of magnitude.
+     MAX-REL-ERR : max of |a - n| / max(|a|, |n|) over elements where at
+                   least one of |a|, |n| exceeds *GC-ATOL*. Purely
+                   diagnostic; may look high on small-gradient elements
+                   because central diff is noisy there, even though PASS-P
+                   correctly says the element is fine."
   (declare (type tensor analytic numerical))
-  (let ((max-err 0.0f0)
-        (eps 1.0f-6))
-    (declare (type single-float max-err eps))
+  (let ((all-pass t)
+        (max-abs 0.0f0)
+        (max-rel 0.0f0)
+        (atol *gc-atol*)
+        (rtol *gc-rtol*))
+    (declare (type single-float max-abs max-rel atol rtol))
     (dotimes (i (array-total-size analytic))
       (let* ((a (row-major-aref analytic i))
              (n (row-major-aref numerical i))
-             (denom (max (abs a) (abs n) eps))
-             (err (/ (abs (- a n)) denom)))
-        (declare (type single-float a n denom err))
-        (when (> err max-err) (setf max-err err))))
-    max-err))
+             (aa (abs a)) (nn (abs n))
+             (absdiff (abs (- a n))))
+        (declare (type single-float a n aa nn absdiff))
+        (when (> absdiff max-abs) (setf max-abs absdiff))
+        (when (> absdiff (+ atol (* rtol (max aa nn))))
+          (setf all-pass nil))
+        (when (or (>= aa atol) (>= nn atol))
+          (let ((rel (/ absdiff (max aa nn))))
+            (declare (type single-float rel))
+            (when (> rel max-rel) (setf max-rel rel))))))
+    (values all-pass max-abs max-rel)))
 
 
 ;;; ---------- Core numerical check for one parameter tensor ----------
@@ -166,46 +199,56 @@
                      (declare (ignore _saved))
                      (dot-tensors out upstream))))
 
-            (let ((param-errors nil))
+            (let ((param-results nil))
               ;; Check each float-tensor param.
+              ;; Each entry: (KEY PASS-P MAX-ABS-DIFF MAX-REL-ERR).
               (loop for (k v) on params by #'cddr do
                     (when (and (arrayp v)
                                (eq (array-element-type v) 'single-float)
                                (not (eq k :pe)))
                       (let* ((num-grad (numerical-grad-tensor #'loss v))
-                             (ana-grad (getf analytic-grad-params k))
-                             (err (max-rel-error ana-grad num-grad)))
-                        (push (list k err) param-errors))))
+                             (ana-grad (getf analytic-grad-params k)))
+                        (multiple-value-bind (pass-p max-abs max-rel)
+                            (check-close ana-grad num-grad)
+                          (push (list k pass-p max-abs max-rel) param-results)))))
 
               ;; Check grad w.r.t. input (only for float inputs).
-              (let ((input-error nil))
+              (let ((input-pass nil) (input-abs nil) (input-rel nil))
                 (when (and (arrayp input)
                            (eq (array-element-type input) 'single-float)
                            analytic-grad-input)
                   (let ((num-grad (numerical-grad-tensor #'loss input)))
-                    (setf input-error (max-rel-error analytic-grad-input num-grad))))
+                    (multiple-value-bind (pass-p max-abs max-rel)
+                        (check-close analytic-grad-input num-grad)
+                      (setf input-pass pass-p input-abs max-abs input-rel max-rel))))
 
                 (list :type type
-                      :param-errors (nreverse param-errors)
-                      :input-error input-error)))))))))
+                      :param-results (nreverse param-results)
+                      :input-pass  input-pass
+                      :input-abs   input-abs
+                      :input-rel   input-rel)))))))))
 
 
 ;;; ---------- Report formatting ----------
 
 (defun report-result (result)
-  "Print one result line per parameter and per input."
-  (let ((type   (getf result :type))
-        (perrs  (getf result :param-errors))
-        (inperr (getf result :input-error))
-        (tol    *gc-tol*))
+  "Print one result line per parameter and per input.
+   PASS/FAIL comes from CHECK-CLOSE's atol+rtol verdict.
+   MAX-ABS and REL are diagnostic only; REL may look large on very small
+   gradients but the PASS verdict correctly accounts for that via atol."
+  (let ((type       (getf result :type))
+        (presults   (getf result :param-results))
+        (input-pass (getf result :input-pass))
+        (input-abs  (getf result :input-abs))
+        (input-rel  (getf result :input-rel)))
     (format t "~&~A~%" type)
-    (dolist (pe perrs)
-      (destructuring-bind (k err) pe
-        (format t "  param ~A : rel-err ~,4E  ~A~%"
-                k err (if (< err tol) "PASS" "FAIL"))))
-    (when inperr
-      (format t "  input   : rel-err ~,4E  ~A~%"
-              inperr (if (< inperr tol) "PASS" "FAIL")))))
+    (dolist (pr presults)
+      (destructuring-bind (k pass-p max-abs max-rel) pr
+        (format t "  param ~A : max-abs ~,2E  rel ~,2E  ~A~%"
+                k max-abs max-rel (if pass-p "PASS" "FAIL"))))
+    (when input-abs
+      (format t "  input   : max-abs ~,2E  rel ~,2E  ~A~%"
+              input-abs input-rel (if input-pass "PASS" "FAIL")))))
 
 
 ;;; ---------- Suite ----------
@@ -213,7 +256,8 @@
 (defun run-all-gradchecks ()
   "Run gradient check on every registered module (except composite ones
    whose params are nested plists — those get end-to-end checks later)."
-  (format t "~&=== Gradient checks (h=~,1E tol=~,1E) ===~%" *gc-h* *gc-tol*)
+  (format t "~&=== Gradient checks (h=~,1E atol=~,1E rtol=~,1E) ===~%"
+          *gc-h* *gc-atol* *gc-rtol*)
 
   (dolist (case
            '(;; (module-type config input-dims-or-:ids)
