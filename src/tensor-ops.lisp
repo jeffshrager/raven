@@ -1,321 +1,414 @@
-;;;; tensor-ops.lisp
-;;;; Core tensor primitives for Raven-LLM.
+;;;; src/tensor-ops.lisp
 ;;;;
-;;;; How to run:
+;;;; Primitive tensor operations. Every op is a paired (forward, backward)
+;;;; function. FORWARD returns (values output saved) where SAVED is
+;;;; whatever the backward needs from the forward pass (usually the inputs,
+;;;; sometimes intermediate values). BACKWARD takes (grad-out saved) and
+;;;; returns gradients w.r.t. each input.
+;;;;
+;;;; Convention for shapes:
+;;;;   - Vectors: (simple-array single-float (N))
+;;;;   - Matrices: (simple-array single-float (M N)), row-major
+;;;;   - MATMUL uses y = W . x convention: W is (M K), x is (K N), y is (M N)
+;;;;     When x is a single vector of length K, treat as (K 1) or use MATVEC.
+;;;;
+;;;; Backward output convention:
+;;;;   - Ops return NEW gradient tensors (not accumulated into existing ones).
+;;;;     The training loop / optimizer is responsible for accumulation.
+;;;;   - This keeps ops pure and easy to test; the cost is one allocation
+;;;;     per op per step, which is fine at this model scale.
+;;;;
+;;;; Activation choice: GELU (Gaussian Error Linear Unit).
+;;;;   Forward:  gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+;;;;   We use the tanh approximation from the original GELU paper:
+;;;;     gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+;;;;   because CL doesn't ship ERF and tanh is standard. This is the same
+;;;;   approximation used in the original BERT/GPT-2 codebases.
+;;;;
+;;;; How to run (from project root):
+;;;;   (load (compile-file "src/utilities.lisp"))
 ;;;;   (load (compile-file "src/tensor-ops.lisp"))
-;;;;   Tests run automatically at load time; look for "All tensor-ops tests passed."
-;;;;
-;;;; Design decisions:
-;;;;   - Element type: single-float (32-bit). Standard for neural nets.
-;;;;   - Storage: struct with flat (simple-array single-float (*)) + shape list.
-;;;;     Shape travels with the data; access has one struct-slot deref of overhead.
-;;;;   - Layout: row-major. Last axis varies fastest.
-;;;;   - No external packages. Everything defined here.
-;;;;
-;;;; Note on (the fixnum ...) sprinkled through hot loops:
-;;;;   SBCL knows loop counters are fixnums, but can't prove that fixnum*fixnum
-;;;;   fits in a fixnum (worst-case overflow to bignum). The (the fixnum ...)
-;;;;   promises the result fits, letting SBCL emit tight integer arithmetic
-;;;;   instead of generic. For array indices bounded by array size, this is safe.
 
-;;; ------------------------------------------------------------------
-;;; Tensor struct and constructors
-;;; ------------------------------------------------------------------
+;;; ---------- Type declarations for speed ----------
+;;; SBCL benefits substantially from knowing that tensors are simple-arrays
+;;; of single-float. We declare the type once here so ops can use it.
 
-(defstruct tensor
-  ;; Flat backing storage. Length = product of shape.
-  (data  (make-array 0 :element-type 'single-float) :type (simple-array single-float (*)))
-  ;; Shape as a list, e.g. (3 4) for a 3x4 matrix, (5) for a length-5 vector.
-  (shape '()                                        :type list))
+(deftype tensor () '(simple-array single-float))
+(deftype tensor-1d () '(simple-array single-float (*)))
+(deftype tensor-2d () '(simple-array single-float (* *)))
 
-(defun shape-size (shape)
-  "Total number of elements implied by SHAPE."
-  (reduce #'* shape :initial-value 1))
 
-(defun make-zeros (shape)
-  "Allocate a tensor of the given SHAPE, initialized to 0.0."
-  (let* ((n   (shape-size shape))
-         (buf (make-array n :element-type 'single-float :initial-element 0.0f0)))
-    (make-tensor :data buf :shape (copy-list shape))))
-
-(defun make-from-list (shape values)
-  "Build a tensor of SHAPE from a flat list of VALUES (row-major order).
-   Convenient for tests and small hand-built matrices."
-  (let* ((n (shape-size shape)))
-    (assert (= n (length values)) ()
-            "make-from-list: shape ~A needs ~D values, got ~D."
-            shape n (length values))
-    (let ((buf (make-array n :element-type 'single-float)))
-      (loop for v in values
-            for i from 0
-            do (setf (aref buf i) (coerce v 'single-float)))
-      (make-tensor :data buf :shape (copy-list shape)))))
-
-;;; ------------------------------------------------------------------
-;;; Indexing
-;;; ------------------------------------------------------------------
-;;; Row-major flat index for coords (i j k ...) with shape (d0 d1 d2 ...):
-;;;   flat = i*(d1*d2*...) + j*(d2*...) + k*(...) + ...
-;;; Computed by folding left-to-right, multiplying by each successive dim.
-
-(defun flat-index (shape coords)
-  "Convert a list of COORDS into a row-major flat index against SHAPE.
-   Signals an error if arity or bounds are wrong."
-  (assert (= (length shape) (length coords)) ()
-          "flat-index: shape ~A and coords ~A have different arities." shape coords)
-  (let ((idx 0))
-    (loop for c    in coords
-          for d    in shape
-          do (assert (and (>= c 0) (< c d)) ()
-                     "flat-index: coord ~D out of bounds for dim ~D." c d)
-             (setf idx (+ (* idx d) c)))
-    idx))
-
-(defun tensor-ref (tensor &rest coords)
-  "Read element at COORDS from TENSOR."
-  (aref (tensor-data tensor) (flat-index (tensor-shape tensor) coords)))
-
-(defun (setf tensor-ref) (value tensor &rest coords)
-  "Write VALUE into TENSOR at COORDS."
-  (setf (aref (tensor-data tensor) (flat-index (tensor-shape tensor) coords))
-        (coerce value 'single-float)))
-
-;;; ------------------------------------------------------------------
-;;; Random initialization
-;;; ------------------------------------------------------------------
-;;; Uniform in [-scale, +scale]. Real init schemes (Xavier, He) come later;
-;;; this is enough to get non-zero activations for testing.
-
-(defun fill-random! (tensor &key (scale 0.1))
-  "Fill TENSOR in-place with uniform random values in [-SCALE, +SCALE]."
-  (let ((buf   (tensor-data tensor))
-        (s     (coerce scale 'single-float))
-        (two-s (coerce (* 2 scale) 'single-float)))
-    (dotimes (i (length buf))
-      (setf (aref buf i) (- (random two-s) s)))
-    tensor))
-
-;;; ------------------------------------------------------------------
-;;; Matmul (2D x 2D -> 2D)
-;;; ------------------------------------------------------------------
-;;; A is (m k), B is (k n), C is (m n). C[i,j] = sum over p of A[i,p]*B[p,j].
-;;; Naive triple loop with loop order i-p-j so B[p,*] and C[i,*] are walked
-;;; contiguously in row-major memory.
-;;; Row-base products hoisted out of inner loops (both for perf and to give
-;;; SBCL a single named fixnum to reason about).
-
-(defun matmul (a b)
-  "Matrix-matrix multiply. A: (m k), B: (k n) -> result: (m n)."
-  (let ((ashape (tensor-shape a))
-        (bshape (tensor-shape b)))
-    (assert (and (= 2 (length ashape)) (= 2 (length bshape))) ()
-            "matmul: both args must be 2D, got shapes ~A and ~A." ashape bshape)
-    (let ((m  (first  ashape))
-          (k  (second ashape))
-          (kb (first  bshape))
-          (n  (second bshape)))
-      (assert (= k kb) ()
-              "matmul: inner dims disagree: ~A vs ~A." ashape bshape)
-      (let* ((out (make-zeros (list m n)))
-             (ad  (tensor-data a))
-             (bd  (tensor-data b))
-             (od  (tensor-data out)))
-        (declare (type (simple-array single-float (*)) ad bd od)
-                 (type fixnum m k n)
-                 (optimize (speed 3) (safety 1)))
-        (dotimes (i m)
-          (let ((i-k (the fixnum (* i k)))
-                (i-n (the fixnum (* i n))))
-            (dotimes (p k)
-              (let ((aip (aref ad (the fixnum (+ i-k p))))
-                    (p-n (the fixnum (* p n))))
-                (dotimes (j n)
-                  (incf (aref od (the fixnum (+ i-n j)))
-                        (* aip (aref bd (the fixnum (+ p-n j))))))))))
-        out))))
-
-;;; ------------------------------------------------------------------
-;;; Elementwise add (in-place)
-;;; ------------------------------------------------------------------
-
-(defun add! (dest src)
-  "Elementwise DEST += SRC, in place. Shapes must match exactly."
-  (assert (equal (tensor-shape dest) (tensor-shape src)) ()
-          "add!: shape mismatch ~A vs ~A."
-          (tensor-shape dest) (tensor-shape src))
-  (let ((dd (tensor-data dest))
-        (sd (tensor-data src)))
-    (declare (type (simple-array single-float (*)) dd sd)
-             (optimize (speed 3) (safety 1)))
-    (dotimes (i (length dd))
-      (incf (aref dd i) (aref sd i))))
-  dest)
-
-;;; ------------------------------------------------------------------
-;;; Broadcast-add: matrix + row-vector
-;;; ------------------------------------------------------------------
-;;; MAT is (m n), BIAS is (n). Adds BIAS to every row of MAT, in place.
-;;; This is the shape you get adding a bias vector after a linear layer.
-
-(defun broadcast-add! (mat bias)
-  "In-place: add row-vector BIAS (n) to each row of matrix MAT (m n)."
-  (let ((mshape (tensor-shape mat))
-        (bshape (tensor-shape bias)))
-    (assert (and (= 2 (length mshape)) (= 1 (length bshape))) ()
-            "broadcast-add!: need 2D matrix and 1D bias, got ~A and ~A." mshape bshape)
-    (let ((m  (first  mshape))
-          (n  (second mshape))
-          (nb (first  bshape)))
-      (assert (= n nb) ()
-              "broadcast-add!: bias length ~D must match matrix cols ~D." nb n)
-      (let ((md (tensor-data mat))
-            (bd (tensor-data bias)))
-        (declare (type (simple-array single-float (*)) md bd)
-                 (type fixnum m n)
-                 (optimize (speed 3) (safety 1)))
-        (dotimes (i m)
-          (let ((row-base (the fixnum (* i n))))
-            (dotimes (j n)
-              (incf (aref md (the fixnum (+ row-base j))) (aref bd j))))))))
-  mat)
-
-;;; ------------------------------------------------------------------
-;;; Transpose (2D)
-;;; ------------------------------------------------------------------
-
-(defun transpose (a)
-  "Return a new tensor that is the transpose of the 2D tensor A."
-  (let ((s (tensor-shape a)))
-    (assert (= 2 (length s)) () "transpose: 2D only, got shape ~A." s)
-    (let* ((m   (first s))
-           (n   (second s))
-           (out (make-zeros (list n m)))
-           (ad  (tensor-data a))
-           (od  (tensor-data out)))
-      (declare (type (simple-array single-float (*)) ad od)
-               (type fixnum m n)
-               (optimize (speed 3) (safety 1)))
-      (dotimes (i m)
-        (let ((i-n (the fixnum (* i n))))
-          (dotimes (j n)
-            ;; out[j,i] = a[i,j]
-            (setf (aref od (the fixnum (+ (the fixnum (* j m)) i)))
-                  (aref ad (the fixnum (+ i-n j)))))))
-      out)))
-
-;;; ------------------------------------------------------------------
-;;; Softmax along last axis (in-place)
-;;; ------------------------------------------------------------------
-;;; For 2D input (m n), softmax each row independently.
-;;; Numerically stable: subtract row max before exp, so largest exp arg is 0.
+;;; ==========================================================================
+;;; MATMUL : y = A . B   where A is (M K), B is (K N), y is (M N)
+;;; ==========================================================================
 ;;;
-;;; Type notes:
-;;;   SUM is explicitly declared single-float, and (exp ...) is wrapped with
-;;;   (the single-float ...). Otherwise SBCL widens SUM's type to a float
-;;;   union and falls back to generic arithmetic in the inner loop.
+;;; Forward: standard triple loop. No blocking / SIMD — that's an optimization
+;;; for later if we need it. At d_model=64 with modest context, plain loops
+;;; on SBCL with type declarations are fast enough.
+;;;
+;;; Backward:
+;;;   grad_A = grad_out . B^T     shape (M K)
+;;;   grad_B = A^T . grad_out     shape (K N)
+;;; Derivation: for y[i,j] = sum_k A[i,k] * B[k,j],
+;;;   dy[i,j]/dA[p,q] = B[q,j] if i=p else 0
+;;;   so d L / d A[p,q] = sum_j (grad_out[p,j] * B[q,j]) = (grad_out . B^T)[p,q]
 
-(defun softmax! (a)
-  "In-place row-wise softmax on 2D tensor A (m n)."
-  (let ((s (tensor-shape a)))
-    (assert (= 2 (length s)) () "softmax!: 2D only, got shape ~A." s)
-    (let ((m  (first s))
-          (n  (second s))
-          (ad (tensor-data a)))
-      (declare (type (simple-array single-float (*)) ad)
-               (type fixnum m n)
-               (optimize (speed 3) (safety 1)))
+(defun matmul-forward (a b)
+  "y = A . B. A is (M K), B is (K N), y is (M N).
+   Saves (A B) for backward."
+  (declare (type tensor-2d a b))
+  (let* ((m (array-dimension a 0))
+         (k (array-dimension a 1))
+         (n (array-dimension b 1))
+         (y (make-tensor (list m n))))
+    (declare (type fixnum m k n)
+             (type tensor-2d y))
+    (assert (= k (array-dimension b 0)) ()
+            "MATMUL shape mismatch: A is ~A, B is ~A"
+            (array-dimensions a) (array-dimensions b))
+    (dotimes (i m)
+      (dotimes (j n)
+        (let ((acc 0.0f0))
+          (declare (type single-float acc))
+          (dotimes (kk k)
+            (incf acc (* (aref a i kk) (aref b kk j))))
+          (setf (aref y i j) acc))))
+    (values y (list a b))))
+
+(defun matmul-backward (grad-out saved)
+  "Returns (values grad-a grad-b)."
+  (declare (type tensor-2d grad-out))
+  (destructuring-bind (a b) saved
+    (declare (type tensor-2d a b))
+    (let* ((m (array-dimension a 0))
+           (k (array-dimension a 1))
+           (n (array-dimension b 1))
+           (grad-a (make-tensor (list m k)))
+           (grad-b (make-tensor (list k n))))
+      (declare (type fixnum m k n)
+               (type tensor-2d grad-a grad-b))
+      ;; grad_A[i,q] = sum_j grad_out[i,j] * B[q,j]
       (dotimes (i m)
-        (let ((base (the fixnum (* i n))))
-          ;; 1. Find row max.
-          (let ((row-max (aref ad base)))
-            (declare (type single-float row-max))
-            (loop for j fixnum from 1 below n
-                  do (let ((v (aref ad (the fixnum (+ base j)))))
-                       (when (> v row-max) (setf row-max v))))
-            ;; 2. Subtract max, exponentiate, accumulate sum.
-            (let ((sum 0.0f0))
-              (declare (type single-float sum))
-              (dotimes (j n)
-                (let ((e (the single-float
-                              (exp (- (aref ad (the fixnum (+ base j)))
-                                      row-max)))))
-                  (setf (aref ad (the fixnum (+ base j))) e)
-                  (incf sum e)))
-              ;; 3. Divide by sum.
-              (let ((inv (/ 1.0f0 sum)))
-                (declare (type single-float inv))
-                (dotimes (j n)
-                  (setf (aref ad (the fixnum (+ base j)))
-                        (* (aref ad (the fixnum (+ base j))) inv))))))))))
-  a)
+        (dotimes (q k)
+          (let ((acc 0.0f0))
+            (declare (type single-float acc))
+            (dotimes (j n)
+              (incf acc (* (aref grad-out i j) (aref b q j))))
+            (setf (aref grad-a i q) acc))))
+      ;; grad_B[q,j] = sum_i A[i,q] * grad_out[i,j]
+      (dotimes (q k)
+        (dotimes (j n)
+          (let ((acc 0.0f0))
+            (declare (type single-float acc))
+            (dotimes (i m)
+              (incf acc (* (aref a i q) (aref grad-out i j))))
+            (setf (aref grad-b q j) acc))))
+      (values grad-a grad-b))))
 
-;;; ------------------------------------------------------------------
-;;; Quick self-tests
-;;; ------------------------------------------------------------------
-;;; Run at load time to catch regressions immediately. Fail loudly.
 
-(defun approx= (x y &optional (eps 1e-5))
-  (< (abs (- x y)) eps))
+;;; ==========================================================================
+;;; ADD : y = a + b   elementwise, same shape
+;;; ==========================================================================
+;;;
+;;; No broadcasting in the base ADD — modules that need bias broadcasting
+;;; use ADD-BIAS below. Keeps this op simple and its backward trivial.
+;;;
+;;; Backward: grad_a = grad_out, grad_b = grad_out. Both inputs pass the
+;;; upstream gradient through unchanged.
 
-(defun run-tensor-ops-tests ()
-  (format t "~&Running tensor-ops tests...~%")
+(defun add-forward (a b)
+  "Elementwise a + b. Shapes must match."
+  (declare (type tensor a b))
+  (assert (equal (array-dimensions a) (array-dimensions b)))
+  (let ((y (tensor-like a)))
+    (declare (type tensor y))
+    (dotimes (i (array-total-size a))
+      (setf (row-major-aref y i)
+            (+ (row-major-aref a i) (row-major-aref b i))))
+    ;; Nothing to save — the backward doesn't depend on inputs.
+    (values y nil)))
 
-  ;; --- indexing round-trip ---
-  (let ((t1 (make-from-list '(2 3) '(1 2 3
-                                     4 5 6))))
-    (assert (= 1.0 (tensor-ref t1 0 0)))
-    (assert (= 6.0 (tensor-ref t1 1 2)))
-    (setf (tensor-ref t1 1 1) 99)
-    (assert (= 99.0 (tensor-ref t1 1 1))))
+(defun add-backward (grad-out saved)
+  "Returns (values grad-a grad-b). Both equal grad-out (fresh copies)."
+  (declare (ignore saved))
+  (declare (type tensor grad-out))
+  (let ((ga (tensor-like grad-out))
+        (gb (tensor-like grad-out)))
+    (dotimes (i (array-total-size grad-out))
+      (setf (row-major-aref ga i) (row-major-aref grad-out i))
+      (setf (row-major-aref gb i) (row-major-aref grad-out i)))
+    (values ga gb)))
 
-  ;; --- matmul: (2x3) * (3x2) = (2x2), hand-checked ---
-  ;; A = [[1 2 3] [4 5 6]], B = [[7 8] [9 10] [11 12]]
-  ;; C = [[1*7+2*9+3*11, 1*8+2*10+3*12] [4*7+5*9+6*11, 4*8+5*10+6*12]]
-  ;;   = [[58 64] [139 154]]
-  (let* ((a (make-from-list '(2 3) '(1 2 3 4 5 6)))
-         (b (make-from-list '(3 2) '(7 8 9 10 11 12)))
-         (c (matmul a b)))
-    (assert (equal '(2 2) (tensor-shape c)))
-    (assert (approx= 58.0  (tensor-ref c 0 0)))
-    (assert (approx= 64.0  (tensor-ref c 0 1)))
-    (assert (approx= 139.0 (tensor-ref c 1 0)))
-    (assert (approx= 154.0 (tensor-ref c 1 1))))
 
-  ;; --- broadcast-add ---
-  (let ((m (make-from-list '(2 3) '(1 1 1 2 2 2)))
-        (b (make-from-list '(3)   '(10 20 30))))
-    (broadcast-add! m b)
-    (assert (approx= 11.0 (tensor-ref m 0 0)))
-    (assert (approx= 21.0 (tensor-ref m 0 1)))
-    (assert (approx= 32.0 (tensor-ref m 1 2))))
+;;; ==========================================================================
+;;; ADD-BIAS : y[i,j] = x[i,j] + b[j]   for x (M N), b (N)
+;;; ==========================================================================
+;;;
+;;; Backward:
+;;;   grad_x = grad_out (shape preserved)
+;;;   grad_b[j] = sum_i grad_out[i,j]   (gradient collapses along broadcast axis)
 
-  ;; --- transpose ---
-  (let* ((a  (make-from-list '(2 3) '(1 2 3 4 5 6)))
-         (at (transpose a)))
-    (assert (equal '(3 2) (tensor-shape at)))
-    (assert (= 1.0 (tensor-ref at 0 0)))
-    (assert (= 4.0 (tensor-ref at 0 1)))
-    (assert (= 6.0 (tensor-ref at 2 1))))
+(defun add-bias-forward (x b)
+  "y[i,j] = x[i,j] + b[j]. x is (M N), b is (N)."
+  (declare (type tensor-2d x)
+           (type tensor-1d b))
+  (let ((m (array-dimension x 0))
+        (n (array-dimension x 1))
+        (y (tensor-like x)))
+    (declare (type fixnum m n)
+             (type tensor-2d y))
+    (assert (= n (length b)))
+    (dotimes (i m)
+      (dotimes (j n)
+        (setf (aref y i j) (+ (aref x i j) (aref b j)))))
+    (values y nil)))
 
-  ;; --- softmax: each row sums to 1, and equal inputs give equal outputs ---
-  (let ((a (make-from-list '(2 3) '(1 1 1
-                                    0 0 100))))
-    (softmax! a)
-    ;; Row 0: uniform -> all 1/3.
-    (assert (approx= (/ 1.0 3.0) (tensor-ref a 0 0)))
-    (assert (approx= (/ 1.0 3.0) (tensor-ref a 0 1)))
-    (assert (approx= (/ 1.0 3.0) (tensor-ref a 0 2)))
-    ;; Row 1: one huge value dominates, others ~0.
-    (assert (approx= 0.0 (tensor-ref a 1 0)))
-    (assert (approx= 0.0 (tensor-ref a 1 1)))
-    (assert (approx= 1.0 (tensor-ref a 1 2)))
-    ;; Rows sum to 1.
-    (dotimes (i 2)
-      (let ((s 0.0))
-        (dotimes (j 3) (incf s (tensor-ref a i j)))
-        (assert (approx= 1.0 s)))))
+(defun add-bias-backward (grad-out saved)
+  "Returns (values grad-x grad-b)."
+  (declare (ignore saved))
+  (declare (type tensor-2d grad-out))
+  (let* ((m (array-dimension grad-out 0))
+         (n (array-dimension grad-out 1))
+         (grad-x (tensor-like grad-out))
+         (grad-b (make-tensor (list n))))
+    (declare (type fixnum m n)
+             (type tensor-2d grad-x)
+             (type tensor-1d grad-b))
+    ;; grad_x = grad_out (elementwise copy)
+    (dotimes (i (* m n))
+      (setf (row-major-aref grad-x i) (row-major-aref grad-out i)))
+    ;; grad_b[j] = sum_i grad_out[i,j]
+    (dotimes (j n)
+      (let ((acc 0.0f0))
+        (declare (type single-float acc))
+        (dotimes (i m)
+          (incf acc (aref grad-out i j)))
+        (setf (aref grad-b j) acc)))
+    (values grad-x grad-b)))
 
-  (format t "All tensor-ops tests passed.~%"))
 
-;; Auto-run tests when this file is loaded.
-(run-tensor-ops-tests)
+;;; ==========================================================================
+;;; SCALE : y = alpha * x   scalar alpha, tensor x
+;;; ==========================================================================
+;;;
+;;; ALPHA is treated as a constant (not a learned parameter). Only x gets a
+;;; gradient. Used e.g. for the 1/sqrt(d_k) factor in attention.
+;;;
+;;; Backward: grad_x = alpha * grad_out.
+
+(defun scale-forward (x alpha)
+  "y = alpha * x elementwise."
+  (declare (type tensor x)
+           (type single-float alpha))
+  (let ((y (tensor-like x)))
+    (dotimes (i (array-total-size x))
+      (setf (row-major-aref y i)
+            (* alpha (row-major-aref x i))))
+    (values y alpha)))
+
+(defun scale-backward (grad-out saved)
+  "Returns grad_x = alpha * grad_out."
+  (declare (type tensor grad-out)
+           (type single-float saved))
+  (let ((gx (tensor-like grad-out)))
+    (dotimes (i (array-total-size grad-out))
+      (setf (row-major-aref gx i)
+            (* saved (row-major-aref grad-out i))))
+    gx))
+
+
+;;; ==========================================================================
+;;; SOFTMAX : along the last axis of a 2D tensor
+;;; ==========================================================================
+;;;
+;;; For x of shape (M N), softmax is computed independently along each row.
+;;; Numerical stability: subtract row max before exp.
+;;;
+;;;   y[i,j] = exp(x[i,j] - max_k x[i,k]) / sum_k exp(x[i,k] - max_l x[i,l])
+;;;
+;;; Backward: the softmax Jacobian for row i is
+;;;   dy[i,j]/dx[i,k] = y[i,j] * (delta_jk - y[i,k])
+;;; Multiplied against grad_out:
+;;;   grad_x[i,k] = y[i,k] * (grad_out[i,k] - sum_j grad_out[i,j] * y[i,j])
+;;; This is the standard "softmax backward" formula. Row-independent.
+;;;
+;;; We save Y (the softmax output) — the backward doesn't need X.
+
+(defun softmax-forward (x)
+  "Row-wise softmax on 2D X of shape (M N)."
+  (declare (type tensor-2d x))
+  (let* ((m (array-dimension x 0))
+         (n (array-dimension x 1))
+         (y (tensor-like x)))
+    (declare (type fixnum m n)
+             (type tensor-2d y))
+    (dotimes (i m)
+      ;; Row max for numerical stability.
+      (let ((row-max most-negative-single-float))
+        (declare (type single-float row-max))
+        (dotimes (j n)
+          (when (> (aref x i j) row-max)
+            (setf row-max (aref x i j))))
+        ;; Compute exp(x - max) and running sum.
+        (let ((sum 0.0f0))
+          (declare (type single-float sum))
+          (dotimes (j n)
+            (let ((e (exp (- (aref x i j) row-max))))
+              (declare (type single-float e))
+              (setf (aref y i j) e)
+              (incf sum e)))
+          ;; Normalize.
+          (let ((inv-sum (/ 1.0f0 sum)))
+            (declare (type single-float inv-sum))
+            (dotimes (j n)
+              (setf (aref y i j) (* (aref y i j) inv-sum)))))))
+    (values y y)))
+
+(defun softmax-backward (grad-out saved)
+  "Returns grad_x. SAVED is the softmax output Y from forward."
+  (declare (type tensor-2d grad-out)
+           (type tensor-2d saved))
+  (let* ((m (array-dimension grad-out 0))
+         (n (array-dimension grad-out 1))
+         (grad-x (tensor-like grad-out)))
+    (declare (type fixnum m n)
+             (type tensor-2d grad-x))
+    (dotimes (i m)
+      ;; dot = sum_j grad_out[i,j] * y[i,j]
+      (let ((dot 0.0f0))
+        (declare (type single-float dot))
+        (dotimes (j n)
+          (incf dot (* (aref grad-out i j) (aref saved i j))))
+        ;; grad_x[i,k] = y[i,k] * (grad_out[i,k] - dot)
+        (dotimes (k n)
+          (setf (aref grad-x i k)
+                (* (aref saved i k)
+                   (- (aref grad-out i k) dot))))))
+    grad-x))
+
+
+;;; ==========================================================================
+;;; GELU : y = 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+;;; ==========================================================================
+;;;
+;;; Elementwise. The tanh approximation avoids needing ERF.
+;;;
+;;; Backward derivation (let c = sqrt(2/pi), a = 0.044715, u = c(x + a x^3)):
+;;;   y = 0.5 x (1 + tanh u)
+;;;   du/dx = c (1 + 3 a x^2)
+;;;   dy/dx = 0.5 (1 + tanh u) + 0.5 x * sech^2(u) * du/dx
+;;;         = 0.5 (1 + tanh u) + 0.5 x (1 - tanh^2 u) * c (1 + 3 a x^2)
+;;;
+;;; We save X (need it in the backward).
+
+(defconstant +gelu-c+ (coerce (sqrt (/ 2.0d0 (float pi 1.0d0))) 'single-float))
+(defconstant +gelu-a+ 0.044715f0)
+
+(defun gelu-forward (x)
+  "Elementwise GELU (tanh approximation)."
+  (declare (type tensor x))
+  (let ((y (tensor-like x)))
+    (dotimes (i (array-total-size x))
+      (let* ((xi (row-major-aref x i))
+             (u  (* +gelu-c+ (+ xi (* +gelu-a+ xi xi xi))))
+             (t- (tanh u)))
+        (declare (type single-float xi u t-))
+        (setf (row-major-aref y i)
+              (* 0.5f0 xi (+ 1.0f0 t-)))))
+    (values y x)))
+
+(defun gelu-backward (grad-out saved)
+  "Returns grad_x. SAVED is the original input X."
+  (declare (type tensor grad-out)
+           (type tensor saved))
+  (let ((gx (tensor-like grad-out)))
+    (dotimes (i (array-total-size grad-out))
+      (let* ((xi (row-major-aref saved i))
+             (u  (* +gelu-c+ (+ xi (* +gelu-a+ xi xi xi))))
+             (t- (tanh u))
+             (sech2 (- 1.0f0 (* t- t-)))
+             (du/dx (* +gelu-c+ (+ 1.0f0 (* 3.0f0 +gelu-a+ xi xi))))
+             (dy/dx (+ (* 0.5f0 (+ 1.0f0 t-))
+                       (* 0.5f0 xi sech2 du/dx))))
+        (declare (type single-float xi u t- sech2 du/dx dy/dx))
+        (setf (row-major-aref gx i)
+              (* dy/dx (row-major-aref grad-out i)))))
+    gx))
+
+
+;;; ==========================================================================
+;;; TRANSPOSE : 2D only
+;;; ==========================================================================
+;;;
+;;; Backward of transpose is transpose. No saved state needed beyond shape.
+
+(defun transpose-forward (x)
+  "Transpose 2D tensor X."
+  (declare (type tensor-2d x))
+  (let* ((m (array-dimension x 0))
+         (n (array-dimension x 1))
+         (y (make-tensor (list n m))))
+    (declare (type fixnum m n)
+             (type tensor-2d y))
+    (dotimes (i m)
+      (dotimes (j n)
+        (setf (aref y j i) (aref x i j))))
+    (values y nil)))
+
+(defun transpose-backward (grad-out saved)
+  "Returns grad_x = transpose(grad_out)."
+  (declare (ignore saved))
+  (declare (type tensor-2d grad-out))
+  (multiple-value-bind (gx _) (transpose-forward grad-out)
+    (declare (ignore _))
+    gx))
+
+
+;;; ==========================================================================
+;;; EMBEDDING-LOOKUP : ids -> rows of embedding table
+;;; ==========================================================================
+;;;
+;;; Table is (vocab-size, d_model). IDs is a length-T fixnum vector.
+;;; Output is (T, d_model): row t of the output is table[ids[t], :].
+;;;
+;;; Backward: accumulates into a grad-table of shape (vocab-size, d_model).
+;;;   For each t, grad-table[ids[t], :] += grad_out[t, :]
+;;; IDs are not differentiable (they're indices), so only the table gets
+;;; a gradient. Note: same id appearing at multiple positions accumulates.
+
+(defun embedding-lookup-forward (table ids)
+  "Look up rows of TABLE at IDS. Returns (T, d_model).
+   Saves (table-shape ids) for backward — we don't save the table itself
+   because the backward only needs its shape."
+  (declare (type tensor-2d table)
+           (type (simple-array fixnum (*)) ids))
+  (let* ((vocab (array-dimension table 0))
+         (d     (array-dimension table 1))
+         (t-len (length ids))
+         (y     (make-tensor (list t-len d))))
+    (declare (type fixnum vocab d t-len)
+             (type tensor-2d y))
+    (dotimes (tt t-len)
+      (let ((id (aref ids tt)))
+        (declare (type fixnum id))
+        (assert (< id vocab) () "Embedding id ~A out of vocab size ~A" id vocab)
+        (dotimes (k d)
+          (setf (aref y tt k) (aref table id k)))))
+    (values y (list (array-dimensions table) ids))))
+
+(defun embedding-lookup-backward (grad-out saved)
+  "Returns grad_table of the original table shape. IDs get no gradient."
+  (declare (type tensor-2d grad-out))
+  (destructuring-bind (table-shape ids) saved
+    (declare (type (simple-array fixnum (*)) ids))
+    (let* ((d     (second table-shape))
+           (t-len (length ids))
+           (grad-table (make-tensor table-shape)))
+      (declare (type fixnum d t-len)
+               (type tensor-2d grad-table))
+      (dotimes (tt t-len)
+        (let ((id (aref ids tt)))
+          (declare (type fixnum id))
+          (dotimes (k d)
+            (incf (aref grad-table id k) (aref grad-out tt k)))))
+      grad-table)))
