@@ -31,6 +31,8 @@
 (load (compile-file "src/training.lisp"))
 (load (compile-file "src/model.lisp"))
 (load (compile-file "src/data.lisp"))
+(load (compile-file "src/inference.lisp"))
+(load (compile-file "src/checkpoint.lisp"))
 
 
 ;;; ------------------------------------------------------------------
