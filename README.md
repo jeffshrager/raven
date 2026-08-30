@@ -25,7 +25,7 @@ raven/
 │   └── experiment.lisp    #   model registry (ensure-model), run-experiment, test-jig
 ├── models/
 │   ├── directory.lisp     #   registry: one entry per model attempt (spec, id, checkpoint, status)
-│   ├── build.log          #   append-only audit trail (:trained / :evaluated events)
+│   ├── build.log          #   append-only audit trail (:training-started / :trained / :training-failed / :evaluated)
 │   └── <id>.ravn          #   checkpoint for model <id> (timestamped, not user-named)
 ├── tests/                 # challenge files: NAME.txt, each line "PROMPT|EXPECTED"
 ├── experiments/
@@ -45,7 +45,7 @@ sbcl --load raven.asd \
      --eval '(test-jig)'
 ```
 
-This runs an experiment that scans a training-spec parameter across two values on a synthetic repeating string — training two tiny models, running both through a mini test suite, then re-running the same experiment to prove the models get reused rather than retrained — and reports `PASS` if every expected file and registry entry is in the right state.
+This runs a synthetic end-to-end check covering the whole registry/experiment machinery: a `:n-layers` sweep (training two tiny models, testing both, then re-running to prove they get reused rather than retrained), a `:steps` milestone sweep (proving a 3-value scan trains in a single continuous run, not three), a direct-model-id manifest, and a deliberately broken spec (proving a failed training run is recorded as `:failed` rather than vanishing). Reports `PASS` if every check holds.
 
 ## Complete example
 
