@@ -104,7 +104,21 @@
 ;;; ------------------------------------------------------------------
 
 (defun write-tensor (tensor stream)
-  "Write RANK, DIMS, then row-major single-float data."
+  "Write RANK, DIMS, then row-major single-float data — see the file
+   header for the full field layout this implements.
+
+   Worked example: a (2 3) tensor (rank 2, 6 elements) writes
+     1 byte   rank=2
+     4 bytes  dim0=2 (little-endian u32)
+     4 bytes  dim1=3 (little-endian u32)
+     24 bytes 6 elements * 4 bytes/single-float, ROW-MAJOR order — so
+              for tensor[[a b c] [d e f]] the bytes on disk encode
+              a, b, c, d, e, f in that order, matching ROW-MAJOR-AREF's
+              iteration order below and in READ-TENSOR-INTO!.
+   Total: 1 + 4 + 4 + 24 = 33 bytes for this one tensor. READ-TENSOR-INTO!
+   reverses this exactly, so the two functions must always agree on
+   field order and byte count — that's why both live in this one file
+   next to each other rather than being derived independently."
   (declare (type tensor tensor))
   (let ((dims (array-dimensions tensor)))
     (write-u8 (length dims) stream)

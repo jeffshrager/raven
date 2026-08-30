@@ -76,7 +76,15 @@
     (values y (list a b))))
 
 (defun matmul-backward (grad-out saved)
-  "Returns (values grad-a grad-b)."
+  "GRAD-OUT is (M N) — same shape as MATMUL-FORWARD's output Y.
+   Returns (values GRAD-A GRAD-B) with GRAD-A shaped like A (M K) and
+   GRAD-B shaped like B (K N) — i.e. every gradient has the same shape
+   as the value it's a gradient FOR, which is the invariant every
+   *-BACKWARD function in this file maintains. See the file header for
+   the derivation (GRAD-A = GRAD-OUT . B^T, GRAD-B = A^T . GRAD-OUT);
+   the loops below compute those two matmuls directly rather than by
+   calling TRANSPOSE-FORWARD + MATMUL-FORWARD, to avoid allocating the
+   transposed copies."
   (declare (type tensor-2d grad-out))
   (destructuring-bind (a b) saved
     (declare (type tensor-2d a b))
@@ -164,7 +172,12 @@
     (values y nil)))
 
 (defun add-bias-backward (grad-out saved)
-  "Returns (values grad-x grad-b)."
+  "GRAD-OUT is (M N); returns (values GRAD-X GRAD-B) shaped like X (M N)
+   and B (N). GRAD-B sums GRAD-OUT down the M axis because B[j] is
+   broadcast — reused, unchanged — across all M rows in the forward
+   pass, so (same multi-use-accumulates-gradient rule as the embedding
+   table and RMSNorm's gamma) every row's contribution to B[j]'s
+   gradient must be added together, not just taken from one row."
   (declare (ignore saved))
   (declare (type tensor-2d grad-out))
   (let* ((m (array-dimension grad-out 0))
@@ -235,7 +248,11 @@
 ;;; We save Y (the softmax output) — the backward doesn't need X.
 
 (defun softmax-forward (x)
-  "Row-wise softmax on 2D X of shape (M N)."
+  "Row-wise softmax on 2D X of shape (M N): each row becomes a
+   probability distribution over its N columns (non-negative, sums to
+   1). In attention (modules.lisp), a row is one query position's
+   affinity scores over all key positions; here it becomes that
+   position's attention-weight distribution."
   (declare (type tensor-2d x))
   (let* ((m (array-dimension x 0))
          (n (array-dimension x 1))
@@ -243,7 +260,12 @@
     (declare (type fixnum m n)
              (type tensor-2d y))
     (dotimes (i m)
-      ;; Row max for numerical stability.
+      ;; Row max for numerical stability: exp() of a large positive
+      ;; logit overflows a single-float, but softmax(x) = softmax(x -
+      ;; c) for ANY constant c (the c cancels between numerator and
+      ;; denominator), so subtracting the row's own max shifts the
+      ;; largest value to exp(0)=1 and every other value to exp(of
+      ;; something <= 0) — never overflows, and the math is unchanged.
       (let ((row-max most-negative-single-float))
         (declare (type single-float row-max))
         (dotimes (j n)
@@ -265,7 +287,12 @@
     (values y y)))
 
 (defun softmax-backward (grad-out saved)
-  "Returns grad_x. SAVED is the softmax output Y from forward."
+  "GRAD-OUT and SAVED (the softmax output Y from forward) are both
+   (M N); returns GRAD-X, also (M N). Applies the row-independent
+   Jacobian formula from the file header: for each row, DOT is
+   sum_j(grad_out[j] * y[j]) — the upstream gradient's overlap with
+   this row's own output distribution — and every element's gradient
+   is y[k] scaled by how much grad_out[k] exceeds that overlap."
   (declare (type tensor-2d grad-out)
            (type tensor-2d saved))
   (let* ((m (array-dimension grad-out 0))
@@ -305,7 +332,13 @@
 (defconstant +gelu-a+ 0.044715f0)
 
 (defun gelu-forward (x)
-  "Elementwise GELU (tanh approximation)."
+  "Elementwise GELU (tanh approximation) — the FFN's nonlinearity (see
+   FFN-FWD, modules.lisp). Chosen because it's the standard activation
+   in GPT-2-style transformers: unlike ReLU it's smooth everywhere
+   (has a well-defined second derivative), which empirically trains
+   better in this architecture. +GELU-C+/+GELU-A+ are the fixed
+   constants from the tanh approximation formula in the header above —
+   not learned, just baked-in math constants."
   (declare (type tensor x))
   (let ((y (tensor-like x)))
     (dotimes (i (array-total-size x))

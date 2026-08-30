@@ -96,7 +96,19 @@
 (defun softmax-ce-bwd (saved)
   "Backward for fused softmax+CE. Consumes SAVED from SOFTMAX-CE-FWD.
    Returns GRAD-LOGITS with same shape as PROBS:
-     grad[t, k] = (1/T) * (probs[t, k] - I[k = target_t])"
+     grad[t, k] = (1/T) * (probs[t, k] - I[k = target_t])
+
+   Worked example (T=1 so the 1/T scale is just 1, V=3, target=1):
+   if the model's softmax probs for this token were [0.2, 0.5, 0.3]
+   (so it gave the correct class, index 1, only 50% probability), the
+   gradient is probs minus a one-hot at the target index:
+       grad = [0.2, 0.5, 0.3] - [0, 1, 0] = [0.2, -0.5, 0.3]
+   Negative at the target (pushes that logit UP, since Adam descends
+   the gradient), positive everywhere else (pushes those logits DOWN)
+   — exactly the direction that increases probs[target] at the expense
+   of the other classes. Implemented as: start every column at
+   scale*probs[t,k] (loop below), then DECF just the target column by
+   the same scale — cheaper than building an explicit one-hot tensor."
   (let* ((probs      (getf saved :probs))
          (target-ids (getf saved :target-ids))
          (t-len (array-dimension probs 0))
@@ -201,7 +213,16 @@
                                            (beta2 *adam-beta2*)
                                            (eps *adam-eps*))
   "Apply one Adam update. Mutates PARAMS and STATE in place. GRADS must
-   mirror PARAMS's structure so that COLLECT-TENSORS returns matching order."
+   mirror PARAMS's structure so that COLLECT-TENSORS returns matching order.
+
+   Why bias-correct (B1T/B2T): M and V both start at zero and are
+   exponential moving averages, so early on — before enough steps have
+   accumulated — they're biased toward zero too (e.g. at STEP=1, M is
+   only 10% of the true gradient, since M = 0.9*0 + 0.1*g). Dividing
+   by (1 - beta^step) exactly cancels that bias (it's 1 at step 1 and
+   approaches 1 as step grows), so the effective learning rate doesn't
+   silently start too small and ramp up — without this correction,
+   early training would move much slower than LR suggests."
   (declare (type single-float lr beta1 beta2 eps))
   (incf (getf state :step))
   (let* ((step  (getf state :step))
@@ -249,7 +270,25 @@
 
 (defun train-step! (model-fwd model-bwd params state input target-ids
                     &key (lr 1.0f-3))
-  "Run one training step. Mutates PARAMS and STATE. Returns the loss."
+  "One complete training step — the full forward/loss/backward/update
+   cycle used by every training loop in this project (TRAIN-LOOP in
+   experiment.lisp calls this once per step). In order:
+     1. MODEL-FWD:    input token ids  -> logits (T V), plus SAVED
+                       state each layer's backward will need.
+     2. SOFTMAX-CE-FWD: logits + target ids -> scalar LOSS, plus SAVED
+                       softmax probabilities for the backward.
+     3. SOFTMAX-CE-BWD: turns that into GRAD-LOGITS (T V) — the
+                       gradient the rest of the network needs to start
+                       backpropagating from.
+     4. MODEL-BWD:    threads GRAD-LOGITS backward through every layer
+                       (in reverse), producing a GRADS tree shaped like
+                       PARAMS. The gradient w.r.t. the model's INPUT
+                       (first return value) is discarded — token ids
+                       are discrete, so there's nothing to do with it.
+     5. ADAM-STEP!:   applies GRADS to PARAMS in place, mutating STATE's
+                       moment buffers too.
+   Mutates PARAMS and STATE. Returns the scalar LOSS from step 2, for
+   the caller to log/average."
   (multiple-value-bind (logits saved) (funcall model-fwd params input)
     (multiple-value-bind (loss ce-saved) (softmax-ce-fwd logits target-ids)
       (let* ((grad-logits (softmax-ce-bwd ce-saved))

@@ -91,17 +91,28 @@
 ;;; Xavier (Glorot) initialization: weights drawn from N(0, 2/(fan_in + fan_out)).
 ;;; Standard choice for layers with symmetric activations. For a linear layer
 ;;; mapping fan_in -> fan_out, this keeps activation variance roughly constant
-;;; across layers at initialization.
+;;; across layers at initialization. The variance formula is symmetric in
+;;; fan_in/fan_out (only their SUM matters), so which one is "in" vs "out"
+;;; never changes the numbers — only which shape convention the caller wants.
 ;;;
-;;; Note: this returns a rank-2 tensor of shape (fan_out fan_in), matching
-;;; the convention y = W . x (W multiplies input on the left). Adjust if you
-;;; want the other convention.
+;;; Shape returned: (D-IN D-OUT), matching THIS PROJECT's actual matmul
+;;; convention (see modules.lisp header): activations are row vectors
+;;; multiplied on the LEFT, y = x . W, so W must be stored (d_in, d_out) for
+;;; MATMUL-FORWARD(x, W) to work with no transpose. (This is the opposite of
+;;; the classical linear-algebra convention y = W . x with column vectors
+;;; and W stored (fan_out, fan_in) — if you've seen Xavier init described
+;;; that way elsewhere, that's why the axis order here looks flipped.)
+;;; Every call site in this codebase passes (xavier-init d-in d-out) in that
+;;; order — e.g. FFN's W1 is (xavier-init d-model d-ff), producing the (D F)
+;;; shape FFN-FWD expects for INPUT (T D) . W1 -> (T F).
 
-(defun xavier-init (fan-out fan-in)
-  "Xavier-initialized weight matrix of shape (FAN-OUT FAN-IN).
-   Samples from N(0, 2/(fan_in + fan_out))."
-  (let* ((std (sqrt (/ 2.0f0 (+ fan-in fan-out))))
-         (tensor (make-tensor (list fan-out fan-in))))
+(defun xavier-init (d-in d-out)
+  "Xavier-initialized weight matrix of shape (D-IN D-OUT) — ready to use
+   directly as MATMUL-FORWARD's second argument against a (T D-IN)
+   input, per this project's (d_in, d_out) weight-storage convention
+   (see the file-section comment above). Samples from N(0, 2/(d_in + d_out))."
+  (let* ((std (sqrt (/ 2.0f0 (+ d-in d-out))))
+         (tensor (make-tensor (list d-in d-out))))
     (dotimes (i (array-total-size tensor))
       (setf (row-major-aref tensor i)
             (* std (randn))))

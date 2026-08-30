@@ -111,7 +111,18 @@
 (defun apply-top-p! (logits p)
   "In-place nucleus mask: keep the smallest set of logits whose cumulative
    softmax probability is >= P; set the rest to -inf. Always keeps at
-   least one token (the highest-prob one)."
+   least one token (the highest-prob one).
+
+   Worked example: probs (after softmax, already sorted descending for
+   this illustration) = [0.5, 0.3, 0.15, 0.05], P=0.8. Walking ORDER
+   (highest-probability index first) and accumulating:
+       after token 1: acc=0.50  (< 0.8, keep going)
+       after token 2: acc=0.80  (>= 0.8, STOP — this token is included)
+       tokens 3, 4                        : never marked in KEEP, masked
+   So the kept set is the top 2 tokens (covering exactly the threshold),
+   not the top-k by count — a peaked distribution keeps few tokens, a
+   flat one keeps many, which is the whole point of nucleus sampling
+   over a fixed top-k."
   (declare (type (simple-array single-float (*)) logits)
            (type single-float p))
   (let* ((n       (length logits))
@@ -177,7 +188,17 @@
                       (max-t nil))
   "Generate N-TOKENS characters after PROMPT and return the full string
    (prompt + generated). PARAMS/SPEC/VOCAB come from TRAIN.
-   MAX-T defaults to the model's :MAX-LEN (from POSITIONAL-SINUSOIDAL)."
+   MAX-T defaults to the model's :MAX-LEN (from POSITIONAL-SINUSOIDAL).
+
+   Each iteration: LOGITS from a forward pass over the current WINDOW
+   (length <= M-T) has shape (T_window V) — row t is the model's
+   next-token prediction made using only tokens 0..t of the window (a
+   consequence of the causal mask in ATTENTION-FWD). So row T_window-1
+   is the prediction for the token that comes after EVERY token
+   currently in the window — exactly the next character we want to
+   sample. That's why only the last row is read out (LAST, below),
+   even though the forward pass computed a full (T_window V) matrix
+   of predictions for every position."
   (let ((fwd   (make-model-fwd spec))
         (m-t   (or max-t (infer-max-context spec))))
     (assert m-t () "GENERATE: could not determine max context; pass :MAX-T explicitly.")
