@@ -152,8 +152,8 @@
          (header-str   (with-standard-io-syntax
                          (let ((*print-readably* t))
                            (prin1-to-string header-plist))))
-         (header-bytes (map '(simple-array (unsigned-byte 8) (*))
-                            #'char-code header-str))
+         (header-bytes (sb-ext:string-to-octets header-str
+                                                 :external-format :utf-8))
          (tensors      (collect-tensors params)))
     (with-open-file (s path :direction :output
                              :element-type '(unsigned-byte 8)
@@ -187,7 +187,8 @@
     ;; Header
     (let* ((hlen         (read-u32-le s))
            (header-bytes (read-bytes hlen s))
-           (header-str   (map 'string #'code-char header-bytes))
+           (header-str   (sb-ext:octets-to-string header-bytes
+                                                  :external-format :utf-8))
            (header       (with-standard-io-syntax (read-from-string header-str)))
            (spec         (getf header :spec))
            (vocab-chars  (getf header :vocab-chars))
