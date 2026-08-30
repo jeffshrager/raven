@@ -22,11 +22,19 @@ raven/
 │   ├── data.lisp          #   vocab, encode/decode, window sampler
 │   ├── inference.lisp     #   sampling (greedy/temperature/top-k/top-p) + generate
 │   ├── checkpoint.lisp    #   binary save/load
-│   └── experiment.lisp    #   train-and-register, run-experiment, test-jig
-├── models/                # trained models: NAME.model / .ravn / .manifest / .log
+│   └── experiment.lisp    #   model registry (ensure-model), run-experiment, test-jig
+├── models/
+│   ├── directory.lisp     #   registry: one entry per trained model (spec, id, checkpoint, loss)
+│   ├── build.log          #   append-only audit trail (:trained / :evaluated events)
+│   └── <id>.ravn          #   checkpoint for model <id> (timestamped, not user-named)
 ├── tests/                 # challenge files: NAME.txt, each line "PROMPT|EXPECTED"
-├── experiments/           # timestamped run outputs
-└── corpus/                # training text
+├── experiments/
+│   └── <name>/
+│       ├── manifest.lisp  #   the experiment recipe (plist, user-written)
+│       ├── index.log      #   append-only, one line per run dir ever created here
+│       └── <timestamp>/   #   one per concrete model tested; NEVER named from a parameter value
+├── corpus/                # training text
+└── seshsums/              # human-readable dev session summaries, one per session
 ```
 
 ## Quick verification (no corpus needed)
@@ -37,7 +45,7 @@ sbcl --load raven.asd \
      --eval '(test-jig)'
 ```
 
-This trains a tiny model on a synthetic repeating string, saves a checkpoint, runs a mini experiment against it, and reports `PASS` if all expected output files were produced.
+This runs an experiment that scans a training-spec parameter across two values on a synthetic repeating string — training two tiny models, running both through a mini test suite, then re-running the same experiment to prove the models get reused rather than retrained — and reports `PASS` if every expected file and registry entry is in the right state.
 
 ## Complete example
 
@@ -49,9 +57,9 @@ mkdir -p corpus
 curl -o corpus/poeall.txt https://www.gutenberg.org/cache/epub/2148/pg2148.txt
 ```
 
-### 2. Write a model spec
+### 2. Models are identified by their spec, not a name
 
-Create `models/poe-64d-3l.model` (any name; the filename before `.model` becomes the model's identifier):
+There's no `.model` file to write by hand and no name to pick. A model is a **training-spec** plist — the same shape a `.model` file used to hold:
 
 ```lisp
 (:corpus-path "corpus/poeall.txt"
@@ -64,28 +72,17 @@ Create `models/poe-64d-3l.model` (any name; the filename before `.model` becomes
  :description "3-layer 64-dim GPT trained on Poe complete works")
 ```
 
-Every key except `:corpus-path` is optional. Full list of supported keys and defaults is in the docstring of `train-and-register` in `src/experiment.lisp`.
+Every key except `:corpus-path` is optional (defaults in the docstring of `canonicalize-training-spec` in `src/experiment.lisp`). You normally never call the registry directly — it's driven by an experiment manifest (step 3) — but you can build one ad hoc:
 
-### 3. Train
-
-```bash
-sbcl --load raven.asd \
-     --eval '(asdf:load-system :raven)' \
-     --eval '(train-and-register "poe-64d-3l")'
+```lisp
+(ensure-model '(:corpus-path "corpus/poeall.txt" :d-model 64 :n-layers 3 :steps 5000))
 ```
 
-Loss is printed periodically. When training finishes, four files exist in `models/`:
+`ensure-model` canonicalizes the spec (fills in defaults, sorts keys) and checks `models/directory.lisp` for a model with an **exactly matching** spec. If one exists, it's reused instantly — no retraining. Otherwise a fresh model is trained and registered under a new timestamped id (`models/<id>.ravn`), and an entry is appended to `models/directory.lisp` (the queryable registry) and `models/build.log` (a flat, append-only audit trail of every `:trained`/`:evaluated` event).
 
-| File | Purpose |
-|------|---------|
-| `poe-64d-3l.model`    | your spec (unchanged) |
-| `poe-64d-3l.ravn`     | binary checkpoint — params + spec + vocab |
-| `poe-64d-3l.manifest` | metadata alist: config, final loss, timestamp |
-| `poe-64d-3l.log`      | append-only event log (one alist per line) |
+Loss is printed periodically during training. By default, the checkpoint is also saved mid-run every 1000 steps (overwriting each time), so a long or interrupted run still leaves a usable checkpoint behind — set `:checkpoint-every` in the spec to change the interval, or `nil` to disable it. This doesn't affect the registry entry, only how the run behaves — training-spec keys that don't define the model itself (`:checkpoint-every`, `:log-every`, `:eval-samples`, `:description`) are ignored when matching against existing models.
 
-Re-running `train-and-register` overwrites the `.ravn` and `.manifest` but appends to `.log`, so retraining history is preserved.
-
-### 4. Use the included test file
+### 3. Use the included test file
 
 The repo ships with `tests/test1.txt` — nine challenges drawn from *The Raven*. Excerpt:
 
@@ -104,35 +101,50 @@ Constraint: prompt + expected must fit in the model's `:context`. Longer lines a
 
 To add your own tests, just drop another `tests/*.txt` file alongside it.
 
-### 5. Write an experiment manifest
+### 4. Write an experiment manifest
 
-Create `experiments/eval-1.manifest`:
+Create `experiments/eval-1/manifest.lisp`. `:model` is a training-spec (see step 2) — train/reuse one model and test it:
 
 ```lisp
-((:model . "poe-64d-3l")
- (:tests . ("test1.txt"))
- (:description . "first evaluation of poe-64d-3l on The Raven excerpts"))
+(:model (:corpus-path "corpus/poeall.txt" :d-model 64 :n-layers 3 :steps 5000)
+ :tests ("test1.txt")
+ :description "first evaluation on The Raven excerpts")
 ```
 
-The `:tests` value can also be `:all` to run every `tests/*.txt` file.
+Or scan any number of spec keys with `(:scan v1 v2 ...)` — every combination is trained-or-reused and tested (a cartesian product, so scanning two keys with three values each tests nine models):
 
-### 6. Run the experiment
+```lisp
+(:model (:corpus-path "corpus/poeall.txt" :d-model 64 :n-layers (:scan 2 3 4) :steps 5000)
+ :tests :all
+ :description "layer-depth sweep")
+```
+
+Or name one exact, already-registered model by its id to re-run tests against it without ever retraining:
+
+```lisp
+(:model "20260830101512" :tests ("test1.txt"))
+```
+
+`:tests` can also be `:all` to run every `tests/*.txt` file.
+
+### 5. Run the experiment
 
 ```bash
 sbcl --load raven.asd \
      --eval '(asdf:load-system :raven)' \
-     --eval '(run-experiment "experiments/eval-1.manifest")'
+     --eval '(run-experiment "eval-1")'
 ```
 
-This creates `experiments/<timestamp>/` containing:
+For each concrete model resolved from `:model` (one, unless scanning), this creates a freshly timestamped `experiments/eval-1/<timestamp>/` — subdirectory names are always timestamps, never derived from a scanned value — containing:
 
 | File | Contents |
 |------|----------|
-| `manifest.lisp` | copy of the manifest for provenance |
-| `results.log`   | one alist per challenge — prompt, expected, greedy generation, NLL, prefix-match, per-char accuracy |
-| `summary.log`   | aggregate stats + per-test breakdown |
+| `manifest.lisp`    | copy of the manifest for provenance |
+| `model-spec.lisp`  | which model this directory's results are for: id, checkpoint path, resolved spec |
+| `results.log`      | one alist per challenge — prompt, expected, greedy generation, NLL, prefix-match, per-char accuracy, tagged `:model-id` |
+| `summary.log`      | aggregate stats + per-test breakdown for that model |
 
-The model's log picks up an `:EVALUATED` entry pointing back to the experiment timestamp.
+`experiments/eval-1/index.log` also gets one line per run directory ever created there (across every invocation), so you can see a sweep's headline numbers without opening each subdirectory. `models/build.log` picks up an `:EVALUATED` entry per model tested, pointing back at the experiment name and run timestamp.
 
 ## Scoring
 
@@ -147,8 +159,8 @@ For each challenge the jig computes:
 
 All persisted metadata is S-expressions — no JSON anywhere.
 
-- `.model` files (user-written config): **plist** — `(:key value :key value ...)`
-- Everything else (auto-generated metadata: `.manifest`, `.log`, `results.log`, `summary.log`): **alist** — `((:key . value) ...)`
+- User-written config (a training-spec, an experiment manifest): **plist** — `(:key value :key value ...)`
+- Everything else (auto-generated metadata: `directory.lisp`, `build.log`, `model-spec.lisp`, `results.log`, `summary.log`, `index.log`): **alist** — `((:key . value) ...)`
 
 Both round-trip through `read`.
 
@@ -159,8 +171,8 @@ Everything works interactively too:
 ```lisp
 (load "raven.asd")
 (asdf:load-system :raven)
-(train-and-register "poe-64d-3l")
-(run-experiment "experiments/eval-1.manifest")
+(ensure-model '(:corpus-path "corpus/poeall.txt" :d-model 64 :n-layers 3 :steps 5000))
+(run-experiment "eval-1")
 
 ;; Or train ad-hoc without registering:
 (multiple-value-bind (params spec vocab)

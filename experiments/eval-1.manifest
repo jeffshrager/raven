@@ -1,4 +1,0 @@
-((:model . "poe-64d-3l")
- (:tests . ("test1.txt"))
- (:description . "first evaluation of poe-64d-3l on The Raven excerpts"))
- 

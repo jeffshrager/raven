@@ -1,9 +1,0 @@
-(:corpus-path "corpus/poeall.txt"
- :d-model     64
- :n-heads     4
- :n-layers    3
- :context     64
- :steps       500 ; 5000
- :lr          0.001
- :description "3-layer 64-dim GPT trained on Poe complete works")
- 

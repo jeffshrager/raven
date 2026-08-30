@@ -3,7 +3,7 @@
 ;;;; The project now uses ASDF. Preferred incantation (from repo root):
 ;;;;   sbcl --load raven.asd \
 ;;;;        --eval '(asdf:load-system :raven)' \
-;;;;        --eval '(train-and-register "poe-64d-3l")'
+;;;;        --eval '(run-experiment "eval-1")'
 ;;;;
 ;;;; This file exists only so `sbcl --load src/main.lisp` still works —
 ;;;; it loads the ASDF system and runs the DEMO. Everything that used

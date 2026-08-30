@@ -1,8 +1,0 @@
-((:EXPERIMENT-TIMESTAMP . "20260829232242") (:MODEL . "poe-64d-3l")
- (:DESCRIPTION . "first evaluation of poe-64d-3l on The Raven excerpts")
- (:TESTS-RUN "tests/test1.txt") (:N-CHALLENGES . 7) (:N-SKIPPED . 2)
- (:MEAN-NLL . 2.7823396) (:MEAN-PREFIX-MATCH . 0.14285715)
- (:MEAN-PER-CHAR-ACC . 0.12344322)
- (:BY-TEST
-  ("test1.txt" (:N . 7) (:SKIPPED . 2) (:MEAN-NLL . 2.7823396)
-   (:MEAN-PREFIX-MATCH . 0.14285715) (:MEAN-PER-CHAR-ACC . 0.12344322))))
