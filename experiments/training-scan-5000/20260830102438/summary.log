@@ -1,0 +1,12 @@
+((:EXPERIMENT . "training-scan-5000") (:RUN . "20260830102438")
+ (:MODEL-ID . "20260830101720")
+ (:SPEC :CORPUS-PATH "corpus/poeall.txt" :CONTEXT 64 :D-MODEL 64 :N-HEADS 4
+  :N-LAYERS 3 :D-FF 256 :EPS 1.0e-5 :LR 0.001 :STEPS 5000)
+ (:DESCRIPTION
+  . "Same architecture as training-scan, extended to 5000 steps -- 1000/2000/3000/4000 should be reused from the registry (no retraining), only 5000 should train fresh.")
+ (:TESTS-RUN "/Users/jeffshrager/Desktop/raven/tests/test1.txt")
+ (:N-CHALLENGES . 7) (:N-SKIPPED . 2) (:MEAN-NLL . 2.1884584)
+ (:MEAN-PREFIX-MATCH . 0.14285715) (:MEAN-PER-CHAR-ACC . 0.11318682)
+ (:BY-TEST
+  ("test1.txt" (:N . 7) (:SKIPPED . 2) (:MEAN-NLL . 2.1884584)
+   (:MEAN-PREFIX-MATCH . 0.14285715) (:MEAN-PER-CHAR-ACC . 0.11318682))))
