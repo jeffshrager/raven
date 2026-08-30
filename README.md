@@ -121,6 +121,8 @@ Or scan any number of spec keys with `(:scan v1 v2 ...)` — every combination i
  :description "layer-depth sweep")
 ```
 
+Scanning `:steps` is special-cased for efficiency: since every value shares the same architecture/corpus/lr and differs only in how long training ran, a single continuous run for the *largest* value passes through exactly the state a standalone run for each smaller value would have stopped at. So `(:steps (:scan 1000 2000 3000 4000))` trains once for 4000 steps and registers a real, independently `:completed` model at each of the four step counts along the way — 4000 total training steps, not 1000+2000+3000+4000=10000. (If some of those step counts are already `:completed` from an earlier run, only the still-missing ones get trained, in one shot up to the largest missing value.) This kicks in automatically whenever `:steps` is scanned, alone or alongside other scanned keys.
+
 Or name one exact, already-registered model by its id to re-run tests against it without ever retraining:
 
 ```lisp

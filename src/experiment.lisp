@@ -186,23 +186,34 @@
     mean))
 
 (defun train-loop (encoded-corpus cfg steps lr log-every
-                   &key checkpoint-path checkpoint-every vocab)
+                   &key checkpoint-path checkpoint-every vocab
+                        milestones on-milestone)
   "Given ENCODED-CORPUS and full model config plist CFG, build a fresh
    model and run STEPS Adam steps. Returns (values PARAMS SPEC).
 
    If CHECKPOINT-PATH is given, saves a checkpoint to it every
    CHECKPOINT-EVERY steps (overwriting each time) so a long run can be
    resumed or inspected without waiting for completion. VOCAB is
-   required in that case (SAVE-CHECKPOINT needs it)."
+   required in that case (SAVE-CHECKPOINT needs it).
+
+   MILESTONES, if given, is a sorted-ascending list of 1-indexed step
+   counts; ON-MILESTONE — a function of (STEP PARAMS SPEC VOCAB
+   ENCODED-CORPUS) — is called exactly once per milestone, in order,
+   the instant that many steps have completed. Independent of
+   CHECKPOINT-PATH/CHECKPOINT-EVERY (that's a single overwritten file
+   for crash safety; milestones are for the caller to register
+   distinct, permanent snapshots) — use either, neither, or both.
+   VOCAB is required whenever ON-MILESTONE is given, same as above."
   (let* ((spec    (build-gpt-lm-spec cfg))
          (params  (build-model-params spec))
          (state   (adam-alloc params))
          (fwd     (make-model-fwd spec))
          (bwd     (make-model-bwd spec))
          (context (getf cfg :max-len))
-         (log     (make-loss-log)))
-    (when checkpoint-path
-      (assert vocab () "train-loop: :vocab is required when :checkpoint-path is given."))
+         (log     (make-loss-log))
+         (remaining-milestones milestones))
+    (when (or checkpoint-path on-milestone)
+      (assert vocab () "train-loop: :vocab is required when :checkpoint-path or :on-milestone is given."))
     (format t "  Model: d=~D H=~D L=~D T=~D V=~D  lr=~,1E~%"
             (getf cfg :d-model) (getf cfg :n-heads) (getf cfg :n-layers)
             context (getf cfg :vocab-size) lr)
@@ -216,7 +227,10 @@
           (when (and checkpoint-path checkpoint-every
                      (zerop (mod (1+ step) checkpoint-every)))
             (format t "  [checkpoint] step ~5D -> ~A~%" (1+ step) checkpoint-path)
-            (save-checkpoint checkpoint-path params spec vocab)))))
+            (save-checkpoint checkpoint-path params spec vocab))
+          (when (and remaining-milestones (= (1+ step) (first remaining-milestones)))
+            (pop remaining-milestones)
+            (funcall on-milestone (1+ step) params spec vocab encoded-corpus)))))
     (values params spec)))
 
 (defun train (&key corpus-path
@@ -230,14 +244,19 @@
                    (steps     1000)
                    (log-every 50)
                    (checkpoint-path nil)
-                   (checkpoint-every nil))
+                   (checkpoint-every nil)
+                   (milestones nil)
+                   (on-milestone nil))
   "Train a GPT-style LM on the corpus at CORPUS-PATH. Returns
    (values PARAMS SPEC VOCAB). Ad-hoc REPL entry point; ENSURE-MODEL
    wraps this for the registry-backed, lookup-or-build workflow.
 
    If CHECKPOINT-PATH is given, a checkpoint is saved there every
    CHECKPOINT-EVERY steps during training (in addition to whatever the
-   caller does with the final PARAMS/SPEC/VOCAB)."
+   caller does with the final PARAMS/SPEC/VOCAB).
+
+   MILESTONES/ON-MILESTONE are passed straight through to TRAIN-LOOP —
+   see its docstring. TRAIN-WITH-MILESTONES is the usual caller."
   (assert corpus-path () "TRAIN: :CORPUS-PATH is required.")
   (format t "~&Loading corpus from ~A ...~%" corpus-path)
   (let* ((text   (load-corpus corpus-path))
@@ -252,7 +271,9 @@
         (train-loop corpus cfg steps lr log-every
                    :checkpoint-path checkpoint-path
                    :checkpoint-every checkpoint-every
-                   :vocab vocab)
+                   :vocab vocab
+                   :milestones milestones
+                   :on-milestone on-milestone)
       (format t "~&Training done.~%")
       (values params spec vocab))))
 
@@ -381,6 +402,28 @@
       (when errorp
         (error "find-model-by-id: no model with id ~S in ~A" id (directory-path)))))
 
+(defun fresh-model-id ()
+  "A timestamp not already used as a model id or checkpoint path."
+  (unique-timestamp (lambda (cand)
+                      (or (find-model-by-id cand :errorp nil)
+                          (probe-file (model-checkpoint-path-for-id cand))))))
+
+(defun make-incomplete-entry (id canon-spec checkpoint-path description)
+  (list (cons :id id) (cons :spec canon-spec) (cons :checkpoint checkpoint-path)
+        (cons :status :incomplete) (cons :started-at id) (cons :description description)))
+
+(defun make-failed-entry (id canon-spec checkpoint-path description condition)
+  (list (cons :id id) (cons :spec canon-spec) (cons :checkpoint checkpoint-path)
+        (cons :status :failed) (cons :error (princ-to-string condition))
+        (cons :started-at id) (cons :description description)))
+
+(defun make-completed-entry (id canon-spec checkpoint-path description final-loss eval-samples
+                             &key (started-at id))
+  (list (cons :id id) (cons :spec canon-spec) (cons :checkpoint checkpoint-path)
+        (cons :status :completed) (cons :final-loss final-loss) (cons :eval-samples eval-samples)
+        (cons :started-at started-at) (cons :completed-at (current-timestamp))
+        (cons :description description)))
+
 (defun ensure-model (spec)
   "SPEC is a training-spec plist (the same shape a .model file used to
    hold). Canonicalizes it and looks it up in models/directory.lisp;
@@ -411,19 +454,12 @@
     (if existing
         (values (cdr (assoc :id existing)) (cdr (assoc :checkpoint existing))
                 existing t)
-        (let* ((meta (training-spec-metadata spec))
-               (id (unique-timestamp
-                    (lambda (cand)
-                      (or (find-model-by-id cand :errorp nil)
-                          (probe-file (model-checkpoint-path-for-id cand))))))
+        (let* ((meta            (training-spec-metadata spec))
+               (id              (fresh-model-id))
                (checkpoint-path (model-checkpoint-path-for-id id))
-               (incomplete-entry (list (cons :id id)
-                                       (cons :spec canon)
-                                       (cons :checkpoint checkpoint-path)
-                                       (cons :status :incomplete)
-                                       (cons :started-at id)
-                                       (cons :description (getf meta :description)))))
-          (save-directory (append (load-directory) (list incomplete-entry)))
+               (description     (getf meta :description)))
+          (save-directory (append (load-directory)
+                                  (list (make-incomplete-entry id canon checkpoint-path description))))
           (append-log-line (build-log-path)
                            (list (cons :event :training-started) (cons :id id)
                                  (cons :at id) (cons :spec canon)))
@@ -445,15 +481,8 @@
                        (encoded    (encode vocab text))
                        (final-loss (eval-loss params module-spec encoded
                                               (getf canon :context) (getf meta :eval-samples)))
-                       (entry (list (cons :id id)
-                                    (cons :spec canon)
-                                    (cons :checkpoint checkpoint-path)
-                                    (cons :status :completed)
-                                    (cons :final-loss final-loss)
-                                    (cons :eval-samples (getf meta :eval-samples))
-                                    (cons :started-at id)
-                                    (cons :completed-at (current-timestamp))
-                                    (cons :description (getf meta :description)))))
+                       (entry (make-completed-entry id canon checkpoint-path description
+                                                    final-loss (getf meta :eval-samples))))
                   (save-checkpoint checkpoint-path params module-spec vocab)
                   (replace-directory-entry id entry)
                   (append-log-line (build-log-path)
@@ -463,15 +492,120 @@
                           id checkpoint-path final-loss)
                   (values id checkpoint-path entry nil)))
             (error (e)
-              (replace-directory-entry
-               id (list (cons :id id) (cons :spec canon) (cons :checkpoint checkpoint-path)
-                        (cons :status :failed) (cons :error (princ-to-string e))
-                        (cons :started-at id) (cons :description (getf meta :description))))
+              (replace-directory-entry id (make-failed-entry id canon checkpoint-path description e))
               (append-log-line (build-log-path)
                                (list (cons :event :training-failed) (cons :id id) (cons :at id)
                                      (cons :spec canon) (cons :error (princ-to-string e))))
               (format t "~&Training FAILED for model ~A: ~A~%" id e)
               (error e)))))))
+
+
+;;; ------------------------------------------------------------------
+;;; Training-length scans: (:scan ...) on :steps
+;;; ------------------------------------------------------------------
+;;;
+;;; A key insight: if several requested models share every defining
+;;; key EXCEPT :steps, they aren't independent — a single continuous
+;;; run for the largest step count passes through exactly the state a
+;;; standalone run for each smaller count would have stopped at. So
+;;; instead of training sum(steps) total across separate runs, we can
+;;; train max(missing-steps) ONCE and register a full, independently
+;;; :COMPLETED model at every requested step count along the way.
+;;; TRAIN-LOOP's MILESTONES/ON-MILESTONE hook is what makes this
+;;; possible without duplicating any training-loop code here.
+
+(defun train-with-milestones (spec milestone-steps)
+  "Train ONE model on SPEC for (the largest value in MILESTONE-STEPS)
+   steps, registering a fresh, independently :COMPLETED
+   models/directory.lisp entry at EVERY step count in MILESTONE-STEPS
+   along the way — not just the end. SPEC's own :STEPS (if any) is
+   ignored; MILESTONE-STEPS alone determines how far training runs and
+   which step counts get registered.
+
+   Crash safety mirrors ENSURE-MODEL: an :INCOMPLETE placeholder for
+   the LARGEST step count is registered before training starts, so a
+   crash before it's reached leaves an honest trace (or :FAILED, if
+   TRAIN signals an error — re-signaled so the caller still sees the
+   failure). Smaller milestones already reached before a crash are
+   genuinely :COMPLETED — they really are valid, independent, usable
+   trained models the instant their snapshot is taken.
+
+   Returns the id of the largest-step-count model."
+  (let* ((sorted         (sort (copy-list (remove-duplicates milestone-steps)) #'<))
+         (max-n          (car (last sorted)))
+         (canon          (canonicalize-training-spec (append (list :steps max-n) spec)))
+         (meta           (training-spec-metadata spec))
+         (description    (getf meta :description))
+         (max-id         (fresh-model-id))
+         (max-checkpoint (model-checkpoint-path-for-id max-id)))
+    (save-directory (append (load-directory)
+                            (list (make-incomplete-entry max-id canon max-checkpoint description))))
+    (append-log-line (build-log-path)
+                     (list (cons :event :training-started) (cons :id max-id)
+                           (cons :at max-id) (cons :spec canon)))
+    (handler-case
+        (progn
+          (train :corpus-path (getf canon :corpus-path)
+                 :context     (getf canon :context)
+                 :d-model     (getf canon :d-model)
+                 :n-heads     (getf canon :n-heads)
+                 :n-layers    (getf canon :n-layers)
+                 :d-ff        (getf canon :d-ff)
+                 :eps         (getf canon :eps)
+                 :lr          (getf canon :lr)
+                 :steps       max-n
+                 :log-every   (getf meta :log-every)
+                 :milestones  sorted
+                 :on-milestone
+                 (lambda (n params module-spec vocab encoded-corpus)
+                   (let* ((is-final        (= n max-n))
+                          (id              (if is-final max-id (fresh-model-id)))
+                          (checkpoint-path (if is-final max-checkpoint (model-checkpoint-path-for-id id)))
+                          (milestone-canon (canonicalize-training-spec (append (list :steps n) spec)))
+                          (final-loss (eval-loss params module-spec encoded-corpus
+                                                 (getf canon :context) (getf meta :eval-samples)))
+                          (entry (make-completed-entry id milestone-canon checkpoint-path description
+                                                       final-loss (getf meta :eval-samples)
+                                                       :started-at (if is-final max-id id))))
+                     (save-checkpoint checkpoint-path params module-spec vocab)
+                     (if is-final
+                         (replace-directory-entry max-id entry)
+                         (save-directory (append (load-directory) (list entry))))
+                     (append-log-line (build-log-path)
+                                      (list (cons :event :trained) (cons :id id) (cons :at id)
+                                            (cons :spec milestone-canon) (cons :final-loss final-loss)))
+                     (format t "~&  [milestone] step ~5D -> model ~A  final-loss=~,4E~%"
+                             n id final-loss))))
+          max-id)
+      (error (e)
+        (replace-directory-entry max-id (make-failed-entry max-id canon max-checkpoint description e))
+        (append-log-line (build-log-path)
+                         (list (cons :event :training-failed) (cons :id max-id) (cons :at max-id)
+                               (cons :spec canon) (cons :error (princ-to-string e))))
+        (format t "~&Training FAILED (milestone run) at id ~A: ~A~%" max-id e)
+        (error e)))))
+
+(defun ensure-model-milestones (spec steps-list)
+  "Like calling ENSURE-MODEL once per value in STEPS-LIST (each with
+   SPEC's :steps overridden to that value), but far cheaper when more
+   than one value needs training: TRAIN-WITH-MILESTONES trains the
+   largest MISSING value once and registers every missing value along
+   the way, instead of training sum(missing) steps across separate
+   runs. Values that already have a :COMPLETED entry are left
+   untouched (reused).
+
+   Returns a list of (ID CHECKPOINT-PATH ENTRY REUSED-P) tuples, one
+   per value in STEPS-LIST, in STEPS-LIST's original order."
+  (flet ((canon-for (n) (canonicalize-training-spec (append (list :steps n) spec))))
+    (let* ((missing (loop for n in steps-list
+                          unless (find-model-by-spec (canon-for n)) collect n)))
+      (when missing
+        (train-with-milestones spec (sort (copy-list missing) #'<)))
+      (mapcar (lambda (n)
+                (let ((e (find-model-by-spec (canon-for n))))
+                  (list (cdr (assoc :id e)) (cdr (assoc :checkpoint e)) e
+                        (not (member n missing)))))
+              steps-list))))
 
 
 ;;; ------------------------------------------------------------------
@@ -605,7 +739,14 @@
    existing model directly. Returns a list of (ID CHECKPOINT-PATH
    ENTRY SCANNED) tuples, one per concrete model to test. SCANNED is
    an alist of just the varying key/value(s) for that concrete model
-   (NIL for a direct-id designator or an unscanned plist)."
+   (NIL for a direct-id designator or an unscanned plist).
+
+   When :STEPS is one of the scanned keys, resolution goes through
+   ENSURE-MODEL-MILESTONES instead of one ENSURE-MODEL call per
+   combination — since every scanned :STEPS value shares the same
+   architecture/corpus/lr and differs only in how long training ran,
+   this trains max(:steps values) once per combination of the OTHER
+   scanned keys, rather than training each value independently."
   (if (stringp model-designator)
       (let ((entry (find-model-by-id model-designator)))
         (unless (eq (cdr (assoc :status entry)) :completed)
@@ -613,12 +754,34 @@
                   model-designator (cdr (assoc :status entry))))
         (list (list model-designator (cdr (assoc :checkpoint entry)) entry nil)))
       (let ((scan-keys (mapcar #'car (spec-scan-keys model-designator))))
-        (mapcar (lambda (concrete)
-                  (multiple-value-bind (id path entry reused-p) (ensure-model concrete)
-                    (declare (ignore reused-p))
-                    (list id path entry
-                          (mapcar (lambda (k) (cons k (getf concrete k))) scan-keys))))
-                (expand-scans model-designator)))))
+        (if (member :steps scan-keys)
+            (resolve-experiment-models-steps-scan model-designator scan-keys)
+            (mapcar (lambda (concrete)
+                      (multiple-value-bind (id path entry reused-p) (ensure-model concrete)
+                        (declare (ignore reused-p))
+                        (list id path entry
+                              (mapcar (lambda (k) (cons k (getf concrete k))) scan-keys))))
+                    (expand-scans model-designator))))))
+
+(defun resolve-experiment-models-steps-scan (model-designator scan-keys)
+  "Handle a MODEL-DESIGNATOR whose SCAN-KEYS include :STEPS. Expands
+   every OTHER scanned key via EXPAND-SCANS as usual (cartesian
+   product); within each resulting combination, the requested :STEPS
+   values are resolved together in one shot via ENSURE-MODEL-MILESTONES."
+  (let* ((steps-values  (rest (getf model-designator :steps)))
+         (other-keys    (remove :steps scan-keys))
+         (without-steps (loop for (k v) on model-designator by #'cddr
+                              unless (eq k :steps) append (list k v)))
+         (other-combos  (expand-scans without-steps)))
+    (loop for combo in other-combos
+          append (mapcar (lambda (result n)
+                           (destructuring-bind (id path entry reused-p) result
+                             (declare (ignore reused-p))
+                             (list id path entry
+                                   (cons (cons :steps n)
+                                         (mapcar (lambda (k) (cons k (getf combo k))) other-keys)))))
+                         (ensure-model-milestones combo steps-values)
+                         steps-values))))
 
 (defun run-tests-against-model (params spec vocab model-id test-files results-path)
   "Run every challenge in TEST-FILES against the loaded model, writing
@@ -781,8 +944,11 @@
   "End-to-end: writes a synthetic corpus, a test file, and an
    experiment manifest that scans one training-spec parameter across
    two values; runs RUN-EXPERIMENT twice (to prove model reuse) and
-   once more against a direct model id; checks the resulting registry
-   and experiment-directory state at each step."
+   once more against a direct model id. Also exercises a :steps
+   milestone scan (proving it trains once, not once per value) and
+   the training-failure path (bad corpus path -> :FAILED entry).
+   Checks the resulting registry and experiment-directory state at
+   each step."
   (format t "~&=== test-jig: end-to-end jig sanity ===~%")
   (let* ((root        (concatenate 'string "/tmp/raven-jig-" (current-timestamp) "/"))
          (corpus-path (concatenate 'string root "corpus.txt"))
@@ -864,6 +1030,49 @@
             (check "direct-id run produced exactly 1 run dir" (= (length dirs3) 1))
             (check "direct-id run didn't touch directory.lisp"
                    (= (length (load-directory)) dirs-before)))))
+      ;; Training-length scan: (:scan ...) on :steps should train ONCE
+      ;; for the max value and register all three milestones, not
+      ;; train independently three times.
+      (let ((n-before        (length (load-directory)))
+            (started-before  (count :training-started (read-log-lines (build-log-path))
+                                    :key (lambda (e) (cdr (assoc :event e)))))
+            (trained-before  (count :trained (read-log-lines (build-log-path))
+                                    :key (lambda (e) (cdr (assoc :event e))))))
+        (save-sexp (experiment-manifest-path "steps-scan")
+                   ;; d-ff 48 is deliberately distinct from the "my-run"
+                   ;; fixture above (d-ff 32) so none of these three
+                   ;; specs can accidentally already exist in the
+                   ;; registry — every one of them must be genuinely new.
+                   (list :model (list :corpus-path  corpus-path
+                                      :context      16 :d-model 16 :n-heads 2
+                                      :n-layers     1 :d-ff 48
+                                      :steps        (list :scan 100 200 300))
+                         :tests '("simple.txt")
+                         :description "jig self-test: training-length milestone scan"))
+        (let ((dirs (run-experiment "steps-scan")))
+          (check "steps-scan produced 3 run dirs" (= (length dirs) 3))
+          (check "steps-scan added exactly 3 directory entries"
+                 (= (length (load-directory)) (+ n-before 3)))
+          (check "steps-scan logged exactly 1 :training-started (one continuous run)"
+                 (= 1 (- (count :training-started (read-log-lines (build-log-path))
+                                :key (lambda (e) (cdr (assoc :event e))))
+                         started-before)))
+          (check "steps-scan logged exactly 3 :trained (one per milestone)"
+                 (= 3 (- (count :trained (read-log-lines (build-log-path))
+                                :key (lambda (e) (cdr (assoc :event e))))
+                         trained-before)))
+          (check "all 3 milestone entries are :completed with the right :steps"
+                 (equal '(100 200 300)
+                        (sort (mapcar (lambda (d)
+                                        (getf (cdr (assoc :spec (load-sexp (concatenate 'string d "model-spec.lisp"))))
+                                              :steps))
+                                      dirs)
+                              #'<)))
+          ;; Re-running the same manifest: every milestone already
+          ;; :completed, so no training at all should happen this time.
+          (run-experiment "steps-scan")
+          (check "re-running steps-scan trains nothing new"
+                 (= (length (load-directory)) (+ n-before 3)))))
       ;; Failure path: a spec whose corpus doesn't exist should error out
       ;; of ENSURE-MODEL, but leave a :FAILED (not orphaned) trace behind.
       (let ((n-before (length (load-directory)))
