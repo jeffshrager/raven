@@ -5,10 +5,13 @@
 ;;;; Now the top of the ASDF-loaded stack. Contains:
 ;;;;   - loss-log utility, TRAIN, TRAIN-LOOP, DEMO
 ;;;;   - Model registry: ENSURE-MODEL looks a training-spec plist up in
-;;;;     models/directory.lisp and reuses the matching model if one
-;;;;     already exists (exact match on canonicalized spec), else
+;;;;     models/directory.lisp and reuses the matching :COMPLETED model
+;;;;     if one already exists (exact match on canonicalized spec), else
 ;;;;     trains a fresh one and registers it under a timestamped id.
-;;;;     Models are no longer user-named.
+;;;;     Models are no longer user-named. An entry starts :INCOMPLETE
+;;;;     before training begins so a crash mid-run leaves an honest
+;;;;     trace rather than an orphaned, unregistered checkpoint file;
+;;;;     it's updated in place to :COMPLETED or :FAILED afterward.
 ;;;;   - EXPAND-SCANS lets an experiment manifest sweep any number of
 ;;;;     training-spec keys via (:scan v1 v2 ...), cartesian-expanded.
 ;;;;   - RUN-EXPERIMENT reads experiments/NAME/manifest.lisp, resolves
@@ -21,13 +24,16 @@
 ;;;; Directory layout (relative to CWD, usually project root):
 ;;;;   models/
 ;;;;     directory.lisp   — registry: list of alist entries, one per
-;;;;                        trained model — (:id :spec :checkpoint
-;;;;                        :final-loss :eval-samples :trained-at
-;;;;                        :description). Read/written whole.
+;;;;                        model attempt — (:id :spec :checkpoint
+;;;;                        :status :started-at ...), :status one of
+;;;;                        :INCOMPLETE (training in progress or the
+;;;;                        process died before finishing), :COMPLETED
+;;;;                        (adds :final-loss :eval-samples
+;;;;                        :completed-at), :FAILED (adds :error, the
+;;;;                        condition TRAIN signaled). Read/written whole.
 ;;;;     build.log        — append-only human-readable audit trail
-;;;;                        (one alist per line): :TRAINED when a model
-;;;;                        is trained, :EVALUATED when one is scored
-;;;;                        by an experiment run.
+;;;;                        (one alist per line): :TRAINING-STARTED,
+;;;;                        :TRAINED, :TRAINING-FAILED, :EVALUATED.
 ;;;;     <id>.ravn         — checkpoint for model <id> (see checkpoint.lisp)
 ;;;;   tests/        One challenge file per group; each non-blank,
 ;;;;                 non-comment line is  PROMPT|EXPECTED
@@ -306,6 +312,12 @@
 
 (defun save-directory (entries) (save-sexp (directory-path) entries))
 
+(defun replace-directory-entry (id new-entry)
+  "Replace the models/directory.lisp entry with :ID ID with NEW-ENTRY."
+  (save-directory
+   (mapcar (lambda (e) (if (string= (cdr (assoc :id e)) id) new-entry e))
+           (load-directory))))
+
 (defparameter +model-defining-keys+
   '(:corpus-path :context :d-model :n-heads :n-layers :d-ff :eps :lr :steps)
   "Keys that define what a trained model IS. Two training-specs
@@ -352,10 +364,14 @@
 
 (defun find-model-by-spec (canon-spec)
   "Return the models/directory.lisp entry whose :spec is EQUAL to
-   CANON-SPEC (already canonicalized), or NIL."
-  (find canon-spec (load-directory)
-        :key (lambda (e) (cdr (assoc :spec e)))
-        :test #'equal))
+   CANON-SPEC (already canonicalized) AND whose :status is :COMPLETED,
+   or NIL. An :INCOMPLETE or :FAILED entry never counts as a match —
+   ENSURE-MODEL always starts a fresh attempt (new id) for a spec
+   whose only prior entry didn't finish successfully, rather than
+   reusing a checkpoint that might be partial, stale, or missing."
+  (find-if (lambda (e) (and (equal (cdr (assoc :spec e)) canon-spec)
+                            (eq (cdr (assoc :status e)) :completed)))
+           (load-directory)))
 
 (defun find-model-by-id (id &key (errorp t))
   "Return the models/directory.lisp entry with :id ID. Signals an
@@ -368,14 +384,25 @@
 (defun ensure-model (spec)
   "SPEC is a training-spec plist (the same shape a .model file used to
    hold). Canonicalizes it and looks it up in models/directory.lisp;
-   if an entry with an EQUAL canonical :spec already exists, reuses it
-   without touching disk. Otherwise trains a fresh model (via TRAIN,
-   which does the mid-run auto-checkpointing), saves it under a new
-   timestamped id, appends an entry to directory.lisp, and appends a
-   :TRAINED line to build.log.
+   if a :COMPLETED entry with an EQUAL canonical :spec already exists,
+   reuses it without touching disk. Otherwise trains a fresh model.
 
-   Returns (values ID CHECKPOINT-PATH ENTRY REUSED-P). Never returns
-   loaded tensors — callers that need PARAMS/SPEC/VOCAB call
+   Before training starts, an :INCOMPLETE entry is appended to
+   directory.lisp (checkpoint path, spec, start time) — so if the
+   process dies mid-run (crash, kill, power loss), even after a
+   mid-run auto-checkpoint has been written, the registry shows an
+   honest :INCOMPLETE record instead of an orphaned .ravn file with no
+   trace anywhere. If TRAIN signals an error, that same entry is
+   updated in place to :FAILED (with the error text) and the error is
+   re-signaled — callers still see the failure, but the registry now
+   explains it instead of just going quiet. On success the entry is
+   updated in place to :COMPLETED with the final loss. FIND-MODEL-BY-SPEC
+   only ever matches :COMPLETED entries, so a spec whose only prior
+   attempt is :INCOMPLETE or :FAILED always gets a fresh id on retry —
+   ENSURE-MODEL never resumes into a broken entry.
+
+   Returns (values ID CHECKPOINT-PATH ENTRY REUSED-P) on success. Never
+   returns loaded tensors — callers that need PARAMS/SPEC/VOCAB call
    LOAD-CHECKPOINT on CHECKPOINT-PATH themselves. This keeps one code
    path for both branches and keeps at most one model's tensors in
    memory at a time during a sweep."
@@ -389,39 +416,62 @@
                     (lambda (cand)
                       (or (find-model-by-id cand :errorp nil)
                           (probe-file (model-checkpoint-path-for-id cand))))))
-               (checkpoint-path (model-checkpoint-path-for-id id)))
-          (multiple-value-bind (params module-spec vocab)
-              (train :corpus-path (getf canon :corpus-path)
-                     :context     (getf canon :context)
-                     :d-model     (getf canon :d-model)
-                     :n-heads     (getf canon :n-heads)
-                     :n-layers    (getf canon :n-layers)
-                     :d-ff        (getf canon :d-ff)
-                     :eps         (getf canon :eps)
-                     :lr          (getf canon :lr)
-                     :steps       (getf canon :steps)
-                     :log-every        (getf meta :log-every)
-                     :checkpoint-path  checkpoint-path
-                     :checkpoint-every (getf meta :checkpoint-every))
-            (let* ((text       (load-corpus (getf canon :corpus-path)))
-                   (encoded    (encode vocab text))
-                   (final-loss (eval-loss params module-spec encoded
-                                          (getf canon :context) (getf meta :eval-samples)))
-                   (entry (list (cons :id id)
-                                (cons :spec canon)
-                                (cons :checkpoint checkpoint-path)
-                                (cons :final-loss final-loss)
-                                (cons :eval-samples (getf meta :eval-samples))
-                                (cons :trained-at id)
-                                (cons :description (getf meta :description)))))
-              (save-checkpoint checkpoint-path params module-spec vocab)
-              (save-directory (append (load-directory) (list entry)))
+               (checkpoint-path (model-checkpoint-path-for-id id))
+               (incomplete-entry (list (cons :id id)
+                                       (cons :spec canon)
+                                       (cons :checkpoint checkpoint-path)
+                                       (cons :status :incomplete)
+                                       (cons :started-at id)
+                                       (cons :description (getf meta :description)))))
+          (save-directory (append (load-directory) (list incomplete-entry)))
+          (append-log-line (build-log-path)
+                           (list (cons :event :training-started) (cons :id id)
+                                 (cons :at id) (cons :spec canon)))
+          (handler-case
+              (multiple-value-bind (params module-spec vocab)
+                  (train :corpus-path (getf canon :corpus-path)
+                         :context     (getf canon :context)
+                         :d-model     (getf canon :d-model)
+                         :n-heads     (getf canon :n-heads)
+                         :n-layers    (getf canon :n-layers)
+                         :d-ff        (getf canon :d-ff)
+                         :eps         (getf canon :eps)
+                         :lr          (getf canon :lr)
+                         :steps       (getf canon :steps)
+                         :log-every        (getf meta :log-every)
+                         :checkpoint-path  checkpoint-path
+                         :checkpoint-every (getf meta :checkpoint-every))
+                (let* ((text       (load-corpus (getf canon :corpus-path)))
+                       (encoded    (encode vocab text))
+                       (final-loss (eval-loss params module-spec encoded
+                                              (getf canon :context) (getf meta :eval-samples)))
+                       (entry (list (cons :id id)
+                                    (cons :spec canon)
+                                    (cons :checkpoint checkpoint-path)
+                                    (cons :status :completed)
+                                    (cons :final-loss final-loss)
+                                    (cons :eval-samples (getf meta :eval-samples))
+                                    (cons :started-at id)
+                                    (cons :completed-at (current-timestamp))
+                                    (cons :description (getf meta :description)))))
+                  (save-checkpoint checkpoint-path params module-spec vocab)
+                  (replace-directory-entry id entry)
+                  (append-log-line (build-log-path)
+                                   (list (cons :event :trained) (cons :id id) (cons :at id)
+                                         (cons :spec canon) (cons :final-loss final-loss)))
+                  (format t "~&Trained model ~A~%  checkpoint: ~A~%  final loss: ~,4E~%"
+                          id checkpoint-path final-loss)
+                  (values id checkpoint-path entry nil)))
+            (error (e)
+              (replace-directory-entry
+               id (list (cons :id id) (cons :spec canon) (cons :checkpoint checkpoint-path)
+                        (cons :status :failed) (cons :error (princ-to-string e))
+                        (cons :started-at id) (cons :description (getf meta :description))))
               (append-log-line (build-log-path)
-                               (list (cons :event :trained) (cons :id id) (cons :at id)
-                                     (cons :spec canon) (cons :final-loss final-loss)))
-              (format t "~&Trained model ~A~%  checkpoint: ~A~%  final loss: ~,4E~%"
-                      id checkpoint-path final-loss)
-              (values id checkpoint-path entry nil)))))))
+                               (list (cons :event :training-failed) (cons :id id) (cons :at id)
+                                     (cons :spec canon) (cons :error (princ-to-string e))))
+              (format t "~&Training FAILED for model ~A: ~A~%" id e)
+              (error e)))))))
 
 
 ;;; ------------------------------------------------------------------
@@ -558,6 +608,9 @@
    (NIL for a direct-id designator or an unscanned plist)."
   (if (stringp model-designator)
       (let ((entry (find-model-by-id model-designator)))
+        (unless (eq (cdr (assoc :status entry)) :completed)
+          (format t "~&WARNING: model ~A has status ~S, not :COMPLETED — results may reflect a partial or failed training run.~%"
+                  model-designator (cdr (assoc :status entry))))
         (list (list model-designator (cdr (assoc :checkpoint entry)) entry nil)))
       (let ((scan-keys (mapcar #'car (spec-scan-keys model-designator))))
         (mapcar (lambda (concrete)
@@ -774,6 +827,8 @@
       (let ((dirs1 (run-experiment "my-run")))
         (check "first run produced 2 run dirs" (= (length dirs1) 2))
         (check "directory.lisp has 2 entries" (= (length (load-directory)) 2))
+        (check "both entries are :completed"
+               (every (lambda (e) (eq (cdr (assoc :status e)) :completed)) (load-directory)))
         (check "build.log has 2 :trained lines"
                (= 2 (count :trained (read-log-lines (build-log-path))
                           :key (lambda (e) (cdr (assoc :event e))))))
@@ -808,7 +863,26 @@
           (let ((dirs3 (run-experiment "my-run-direct")))
             (check "direct-id run produced exactly 1 run dir" (= (length dirs3) 1))
             (check "direct-id run didn't touch directory.lisp"
-                   (= (length (load-directory)) dirs-before))))))
+                   (= (length (load-directory)) dirs-before)))))
+      ;; Failure path: a spec whose corpus doesn't exist should error out
+      ;; of ENSURE-MODEL, but leave a :FAILED (not orphaned) trace behind.
+      (let ((n-before (length (load-directory)))
+            (bad-spec (list :corpus-path (concatenate 'string root "no-such-corpus.txt")
+                            :d-model 8 :n-heads 2 :n-layers 1 :context 8 :steps 10)))
+        (let ((errored (handler-case (progn (ensure-model bad-spec) nil)
+                        (error () t))))
+          (check "ensure-model on a bad spec signals an error" errored))
+        (let* ((dir (load-directory))
+               (new-entry (find-if (lambda (e) (not (eq (cdr (assoc :status e)) :completed)))
+                                   dir :from-end t)))
+          (check "exactly one new directory entry was added" (= (length dir) (1+ n-before)))
+          (check "the new entry is :failed with an :error message"
+                 (and new-entry
+                      (eq (cdr (assoc :status new-entry)) :failed)
+                      (stringp (cdr (assoc :error new-entry)))))
+          (check "build.log recorded :training-failed"
+                 (find-if (lambda (e) (eq (cdr (assoc :event e)) :training-failed))
+                          (read-log-lines (build-log-path)))))))
     (if pass
         (format t "~&All checks passed  PASS~%")
         (format t "~&Some checks failed  FAIL~%"))

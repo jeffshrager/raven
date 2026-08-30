@@ -24,7 +24,7 @@ raven/
 │   ├── checkpoint.lisp    #   binary save/load
 │   └── experiment.lisp    #   model registry (ensure-model), run-experiment, test-jig
 ├── models/
-│   ├── directory.lisp     #   registry: one entry per trained model (spec, id, checkpoint, loss)
+│   ├── directory.lisp     #   registry: one entry per model attempt (spec, id, checkpoint, status)
 │   ├── build.log          #   append-only audit trail (:trained / :evaluated events)
 │   └── <id>.ravn          #   checkpoint for model <id> (timestamped, not user-named)
 ├── tests/                 # challenge files: NAME.txt, each line "PROMPT|EXPECTED"
@@ -78,7 +78,9 @@ Every key except `:corpus-path` is optional (defaults in the docstring of `canon
 (ensure-model '(:corpus-path "corpus/poeall.txt" :d-model 64 :n-layers 3 :steps 5000))
 ```
 
-`ensure-model` canonicalizes the spec (fills in defaults, sorts keys) and checks `models/directory.lisp` for a model with an **exactly matching** spec. If one exists, it's reused instantly — no retraining. Otherwise a fresh model is trained and registered under a new timestamped id (`models/<id>.ravn`), and an entry is appended to `models/directory.lisp` (the queryable registry) and `models/build.log` (a flat, append-only audit trail of every `:trained`/`:evaluated` event).
+`ensure-model` canonicalizes the spec (fills in defaults, sorts keys) and checks `models/directory.lisp` for a **:completed** model with an exactly matching spec. If one exists, it's reused instantly — no retraining. Otherwise a fresh model is trained and registered under a new timestamped id (`models/<id>.ravn`).
+
+Before training starts, an entry is written with `:status :incomplete` — so if the process dies mid-run (crash, kill, power loss), even after a mid-run auto-checkpoint has been saved, the registry shows an honest `:incomplete` record instead of an orphaned, untracked `.ravn` file. That same entry is updated in place once training ends: to `:completed` (with the final loss) on success, or to `:failed` (with the error text) if training raised an error — the error still propagates to the caller either way. A spec whose only prior attempt is `:incomplete` or `:failed` is never reused; asking for it again always starts a fresh attempt under a new id. Every state transition is also appended to `models/build.log` (`:training-started` / `:trained` / `:training-failed` / `:evaluated`) as a flat, human-readable audit trail.
 
 Loss is printed periodically during training. By default, the checkpoint is also saved mid-run every 1000 steps (overwriting each time), so a long or interrupted run still leaves a usable checkpoint behind — set `:checkpoint-every` in the spec to change the interval, or `nil` to disable it. This doesn't affect the registry entry, only how the run behaves — training-spec keys that don't define the model itself (`:checkpoint-every`, `:log-every`, `:eval-samples`, `:description`) are ignored when matching against existing models.
 
