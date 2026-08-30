@@ -1,35 +1,48 @@
 ;;;; experiment.lisp
 ;;;;
-;;;; Testing jig for Raven-LLM.
+;;;; Testing jig + training driver for Raven-LLM.
+;;;;
+;;;; Now the top of the ASDF-loaded stack. Contains:
+;;;;   - loss-log utility, TRAIN, TRAIN-LOOP, DEMO
+;;;;     (moved here from the old src/main.lisp)
+;;;;   - TRAIN-AND-REGISTER — read spec from models/<name>.model, train,
+;;;;     save checkpoint + manifest + log entry
+;;;;   - RUN-EXPERIMENT — run tests against a registered model
+;;;;   - TEST-JIG — end-to-end self-test
 ;;;;
 ;;;; Directory layout (relative to CWD, usually project root):
-;;;;   models/       trained checkpoints, one triple per model:
-;;;;                   NAME.ravn      — binary checkpoint (see checkpoint.lisp)
-;;;;                   NAME.manifest  — S-expression alist of training metadata
-;;;;                   NAME.log       — append-only S-expression event log
-;;;;   tests/        one challenge file per group (e.g. raven.txt, cask.txt).
-;;;;                 Each non-blank, non-comment line is a challenge:
-;;;;                   PROMPT|EXPECTED
-;;;;                 Lines starting with ";" are comments. Blank lines ignored.
-;;;;   experiments/  timestamped subdirs (YYYYMMDDHHMMSS/), each contains:
-;;;;                   manifest.lisp  — copy of the experiment manifest
+;;;;   models/       Per model NAME:
+;;;;                   NAME.model     — spec (plist, user-written)
+;;;;                   NAME.ravn      — checkpoint (binary; see checkpoint.lisp)
+;;;;                   NAME.manifest  — post-train metadata (alist, auto-written)
+;;;;                   NAME.log       — append-only event log (alist per line)
+;;;;   tests/        One challenge file per group; each non-blank,
+;;;;                 non-comment line is  PROMPT|EXPECTED
+;;;;                 Lines starting with ";" are comments.
+;;;;   experiments/  Timestamped subdirs (YYYYMMDDHHMMSS/), each contains:
+;;;;                   manifest.lisp  — copy of the experiment manifest (alist)
 ;;;;                   results.log    — one alist per challenge, one per line
 ;;;;                   summary.log    — single alist with aggregate stats
 ;;;;
-;;;; All persisted metadata is S-expression alists ((:key . value) ...).
-;;;; No JSON anywhere.
+;;;; File format note:
+;;;;   .MODEL files (user-written config): PLIST, e.g.
+;;;;     (:corpus-path "corpus/poeall.txt" :d-model 64 :n-layers 3 :steps 5000)
+;;;;   Everything else (auto-generated metadata): ALIST of (:key . value)
+;;;;   pairs. Both are S-expressions — no JSON anywhere.
 ;;;;
-;;;; How to run (from repo root in an SBCL REPL, after loading main.lisp
-;;;; and checkpoint.lisp):
-;;;;   (load (compile-file "src/experiment.lisp"))
-;;;;   (test-jig)
+;;;; How to run (from project root):
+;;;;   sbcl --load raven.asd \
+;;;;        --eval '(asdf:load-system :raven)' \
+;;;;        --eval '(test-jig)'
 ;;;;
 ;;;; Typical usage:
-;;;;   (train-and-register :name "poe-64d-3l"
-;;;;                       :corpus-path "corpus/poeall.txt"
-;;;;                       :steps 5000)
-;;;;   ;; write experiments/my-run.manifest — an alist with :MODEL and :TESTS
-;;;;   (run-experiment "experiments/my-run.manifest")
+;;;;   ;; write models/poe-64d-3l.model containing:
+;;;;   ;;   (:corpus-path "corpus/poeall.txt" :d-model 64 :n-layers 3 :steps 5000)
+;;;;   (train-and-register "poe-64d-3l")
+;;;;
+;;;;   ;; write experiments/eval-1.manifest containing:
+;;;;   ;;   ((:model . "poe-64d-3l") (:tests . ("raven.txt")))
+;;;;   (run-experiment "experiments/eval-1.manifest")
 
 (in-package :cl-user)
 
@@ -53,10 +66,7 @@
     (format nil "~4,'0D~2,'0D~2,'0D~2,'0D~2,'0D~2,'0D" year mo day h m s)))
 
 (defun save-sexp (path sexp)
-  "Write SEXP to PATH in a human-readable, read-safe form. Strings are
-   escaped (so they read back exactly) but their SIMPLE-BASE-STRING type
-   isn't preserved — we don't need it, and *PRINT-READABLY* T would
-   otherwise clutter files with '#A((N) BASE-CHAR . \"...\")' wrappers."
+  "Write SEXP to PATH in a human-readable, read-safe form."
   (ensure-directories-exist path)
   (with-open-file (s path :direction :output
                           :if-exists :supersede
@@ -74,9 +84,7 @@
       (read s))))
 
 (defun append-log-line (path sexp)
-  "Append PRIN1 of SEXP + newline to PATH (creates the file if missing).
-   Same *PRINT-READABLY* NIL convention as SAVE-SEXP — human-readable
-   strings, still reads back correctly."
+  "Append PRIN1 of SEXP + newline to PATH (creates the file if missing)."
   (ensure-directories-exist path)
   (with-open-file (s path :direction :output
                           :if-exists :append
@@ -87,23 +95,108 @@
         (prin1 sexp s)
         (terpri s)))))
 
+(defun model-spec-path       (name) (concatenate 'string *models-dir* name ".model"))
 (defun model-checkpoint-path (name) (concatenate 'string *models-dir* name ".ravn"))
 (defun model-manifest-path   (name) (concatenate 'string *models-dir* name ".manifest"))
 (defun model-log-path        (name) (concatenate 'string *models-dir* name ".log"))
 
 
 ;;; ------------------------------------------------------------------
-;;; Loss estimation
+;;; Loss-log + generic training driver (moved from old main.lisp)
+;;; ------------------------------------------------------------------
+
+(defstruct loss-log
+  (sum 0.0f0 :type single-float)
+  (n   0     :type fixnum))
+
+(defun loss-log-add! (log l)
+  (incf (loss-log-sum log) l)
+  (incf (loss-log-n log)))
+
+(defun loss-log-mean-and-reset! (log)
+  (let ((mean (if (zerop (loss-log-n log))
+                  0.0f0
+                  (/ (loss-log-sum log) (loss-log-n log)))))
+    (setf (loss-log-sum log) 0.0f0
+          (loss-log-n log)   0)
+    mean))
+
+(defun train-loop (encoded-corpus cfg steps lr log-every)
+  "Given ENCODED-CORPUS and full model config plist CFG, build a fresh
+   model and run STEPS Adam steps. Returns (values PARAMS SPEC)."
+  (let* ((spec    (build-gpt-lm-spec cfg))
+         (params  (build-model-params spec))
+         (state   (adam-alloc params))
+         (fwd     (make-model-fwd spec))
+         (bwd     (make-model-bwd spec))
+         (context (getf cfg :max-len))
+         (log     (make-loss-log)))
+    (format t "  Model: d=~D H=~D L=~D T=~D V=~D  lr=~,1E~%"
+            (getf cfg :d-model) (getf cfg :n-heads) (getf cfg :n-layers)
+            context (getf cfg :vocab-size) lr)
+    (dotimes (step steps)
+      (multiple-value-bind (input target) (sample-window encoded-corpus context)
+        (let ((loss (train-step! fwd bwd params state input target :lr lr)))
+          (loss-log-add! log loss)
+          (when (zerop (mod (1+ step) log-every))
+            (format t "  step ~5D  avg-loss ~,4E~%"
+                    (1+ step) (loss-log-mean-and-reset! log))))))
+    (values params spec)))
+
+(defun train (&key corpus-path
+                   (context   64)
+                   (d-model   64)
+                   (n-heads   4)
+                   (n-layers  3)
+                   (d-ff      nil)         ; NIL ⇒ 4 * d-model
+                   (eps       1.0f-5)
+                   (lr        1.0f-3)
+                   (steps     1000)
+                   (log-every 50))
+  "Train a GPT-style LM on the corpus at CORPUS-PATH. Returns
+   (values PARAMS SPEC VOCAB). Ad-hoc REPL entry point;
+   TRAIN-AND-REGISTER wraps this and reads the same knobs from
+   models/NAME.model."
+  (assert corpus-path () "TRAIN: :CORPUS-PATH is required.")
+  (format t "~&Loading corpus from ~A ...~%" corpus-path)
+  (let* ((text   (load-corpus corpus-path))
+         (vocab  (build-vocab text))
+         (v      (vocab-size vocab))
+         (corpus (encode vocab text))
+         (cfg    (list :vocab-size v :d-model d-model :n-heads n-heads
+                       :n-layers n-layers :max-len context
+                       :d-ff d-ff :eps eps)))
+    (format t "  corpus chars=~D  vocab=~D~%" (length text) v)
+    (multiple-value-bind (params spec) (train-loop corpus cfg steps lr log-every)
+      (format t "~&Training done.~%")
+      (values params spec vocab))))
+
+(defun demo (&key (steps 300) (log-every 50))
+  "Self-contained synthetic training run. No corpus file needed."
+  (format t "~&=== Demo training on synthetic corpus ===~%")
+  (let* ((text   (with-output-to-string (s)
+                   (dotimes (i 200) (declare (ignore i))
+                     (write-string "the quick brown fox " s))))
+         (vocab  (build-vocab text))
+         (v      (vocab-size vocab))
+         (corpus (encode vocab text))
+         (cfg    (list :vocab-size v :d-model 16 :n-heads 2
+                       :n-layers 1 :max-len 16 :d-ff 32 :eps 1.0f-5)))
+    (format t "  synthetic corpus chars=~D  vocab=~D~%" (length text) v)
+    (train-loop corpus cfg steps 5.0f-3 log-every)
+    (format t "~&Demo done.~%")))
+
+
+;;; ------------------------------------------------------------------
+;;; Final-loss estimation
 ;;; ------------------------------------------------------------------
 
 (defun eval-loss (params spec corpus context n-samples)
-  "Estimate mean per-token loss by sampling N-SAMPLES random windows.
-   Used to record a stable 'final loss' number in the model manifest."
+  "Estimate mean per-token loss by averaging N-SAMPLES random windows."
   (let ((fwd (make-model-fwd spec))
         (total 0.0f0))
     (declare (type single-float total))
-    (dotimes (i n-samples)
-      (declare (ignore i))
+    (dotimes (i n-samples) (declare (ignore i))
       (multiple-value-bind (input target) (sample-window corpus context)
         (multiple-value-bind (logits sv) (funcall fwd params input)
           (declare (ignore sv))
@@ -112,58 +205,89 @@
 
 
 ;;; ------------------------------------------------------------------
-;;; Train and register
+;;; Train and register (spec-file driven)
 ;;; ------------------------------------------------------------------
 
-(defun train-and-register (&key name corpus-path
-                                (context 64) (d-model 64) (n-heads 4)
-                                (n-layers 3) (d-ff nil) (eps 1.0f-5)
-                                (lr 1.0f-3) (steps 5000) (log-every 100)
-                                (eval-samples 30)
-                                (description nil))
-  "Train a fresh model on CORPUS-PATH, save checkpoint + manifest under
-   models/NAME.{ravn,manifest}, and append a :TRAINED event to
-   models/NAME.log. Returns (values PARAMS SPEC VOCAB MANIFEST-ALIST)."
-  (assert name         () "train-and-register: :NAME required")
-  (assert corpus-path  () "train-and-register: :CORPUS-PATH required")
+(defun train-and-register (name)
+  "Read models/NAME.model (a plist), train per that spec, save
+   models/NAME.{ravn,manifest} and append a :TRAINED event to
+   models/NAME.log. Returns (values PARAMS SPEC VOCAB MANIFEST-ALIST).
+
+   Supported .model plist keys (all optional except :CORPUS-PATH,
+   defaults in parens):
+     :corpus-path (REQUIRED) — path to training corpus text file
+     :context      (64)      — sequence length (T)
+     :d-model      (64)      — model width
+     :n-heads      (4)
+     :n-layers     (3)
+     :d-ff         (4*d-model)
+     :eps          (1e-5)
+     :lr           (1e-3)
+     :steps        (5000)
+     :log-every    (100)
+     :eval-samples (30)      — # random windows averaged for :FINAL-LOSS
+     :description  (NIL)     — free-text note, copied into the manifest
+
+   Overwrites any existing .ravn / .manifest for this NAME (the .log is
+   append-only, so re-training history is preserved)."
+  (assert (stringp name) () "train-and-register: NAME must be a string.")
   (ensure-directories-exist *models-dir*)
-  (multiple-value-bind (params spec vocab)
-      (train :corpus-path corpus-path :context context :d-model d-model
-             :n-heads n-heads :n-layers n-layers :d-ff d-ff :eps eps
-             :lr lr :steps steps :log-every log-every)
-    (let* ((text        (load-corpus corpus-path))
-           (encoded     (encode vocab text))
-           (final-loss  (eval-loss params spec encoded context eval-samples))
-           (timestamp   (current-timestamp))
-           (checkpoint  (model-checkpoint-path name))
-           (manifest    (model-manifest-path name))
-           (log-path    (model-log-path name))
-           (manifest-alist
-             (list (cons :name        name)
-                   (cons :corpus      corpus-path)
-                   (cons :vocab-size  (vocab-size vocab))
-                   (cons :config      (list (cons :context  context)
-                                            (cons :d-model  d-model)
-                                            (cons :n-heads  n-heads)
-                                            (cons :n-layers n-layers)
-                                            (cons :d-ff     (or d-ff (* 4 d-model)))
-                                            (cons :eps      eps)))
-                   (cons :training    (list (cons :steps        steps)
-                                            (cons :lr           lr)
-                                            (cons :final-loss   final-loss)
-                                            (cons :eval-samples eval-samples)))
-                   (cons :trained-at  timestamp)
-                   (cons :description description))))
-      (save-checkpoint checkpoint params spec vocab)
-      (save-sexp manifest manifest-alist)
-      (append-log-line log-path
-                       (list (cons :event      :trained)
-                             (cons :at         timestamp)
-                             (cons :steps      steps)
-                             (cons :final-loss final-loss)))
-      (format t "~&Registered model ~S~%  checkpoint: ~A~%  manifest:   ~A~%  final loss: ~,4E~%"
-              name checkpoint manifest final-loss)
-      (values params spec vocab manifest-alist))))
+  (let ((spec-path (model-spec-path name)))
+    (unless (probe-file spec-path)
+      (error "train-and-register: spec file ~A not found. Create it first with the model plist."
+             spec-path))
+    (let* ((spec         (load-sexp spec-path))
+           (corpus-path  (or (getf spec :corpus-path)
+                             (error "train-and-register: ~A missing :CORPUS-PATH"
+                                    spec-path)))
+           (context      (getf spec :context 64))
+           (d-model      (getf spec :d-model 64))
+           (n-heads      (getf spec :n-heads 4))
+           (n-layers     (getf spec :n-layers 3))
+           (d-ff         (getf spec :d-ff))
+           (eps          (coerce (getf spec :eps 1.0f-5) 'single-float))
+           (lr           (coerce (getf spec :lr 1.0f-3) 'single-float))
+           (steps        (getf spec :steps 5000))
+           (log-every    (getf spec :log-every 100))
+           (eval-samples (getf spec :eval-samples 30))
+           (description  (getf spec :description)))
+      (multiple-value-bind (params model-spec vocab)
+          (train :corpus-path corpus-path :context context :d-model d-model
+                 :n-heads n-heads :n-layers n-layers :d-ff d-ff :eps eps
+                 :lr lr :steps steps :log-every log-every)
+        (let* ((text         (load-corpus corpus-path))
+               (encoded      (encode vocab text))
+               (final-loss   (eval-loss params model-spec encoded context eval-samples))
+               (timestamp    (current-timestamp))
+               (checkpoint   (model-checkpoint-path name))
+               (manifest-p   (model-manifest-path name))
+               (log-path     (model-log-path name))
+               (manifest-alist
+                 (list (cons :name        name)
+                       (cons :corpus      corpus-path)
+                       (cons :vocab-size  (vocab-size vocab))
+                       (cons :config      (list (cons :context  context)
+                                                (cons :d-model  d-model)
+                                                (cons :n-heads  n-heads)
+                                                (cons :n-layers n-layers)
+                                                (cons :d-ff     (or d-ff (* 4 d-model)))
+                                                (cons :eps      eps)))
+                       (cons :training    (list (cons :steps        steps)
+                                                (cons :lr           lr)
+                                                (cons :final-loss   final-loss)
+                                                (cons :eval-samples eval-samples)))
+                       (cons :trained-at  timestamp)
+                       (cons :description description))))
+          (save-checkpoint checkpoint params model-spec vocab)
+          (save-sexp manifest-p manifest-alist)
+          (append-log-line log-path
+                           (list (cons :event      :trained)
+                                 (cons :at         timestamp)
+                                 (cons :steps      steps)
+                                 (cons :final-loss final-loss)))
+          (format t "~&Registered model ~S~%  checkpoint: ~A~%  manifest:   ~A~%  final loss: ~,4E~%"
+                  name checkpoint manifest-p final-loss)
+          (values params model-spec vocab manifest-alist))))))
 
 
 ;;; ------------------------------------------------------------------
@@ -201,9 +325,8 @@
 ;;; ------------------------------------------------------------------
 
 (defun score-nll (params spec vocab prompt expected)
-  "Mean NLL of EXPECTED given PROMPT under the model. Deterministic —
-   doesn't sample. Assumes prompt+expected fits within model's max-len
-   (a longer eval would need to slide the context window)."
+  "Mean NLL of EXPECTED given PROMPT under the model. Deterministic.
+   Requires prompt+expected ≤ model max-len."
   (let* ((prompt-ids   (encode vocab prompt))
          (expected-ids (encode vocab expected))
          (n-exp        (length expected-ids))
@@ -230,12 +353,8 @@
       (/ nll (float n-exp)))))
 
 (defun score-challenge (params spec vocab prompt expected)
-  "Combine deterministic NLL with a greedy generation and its
-   character-level scores. Returns an alist:
-     (:nll . <mean nll of expected>)
-     (:greedy . <string, length = length(expected)>)
-     (:prefix-match . <how many leading chars agree, 0..len(expected)>)
-     (:per-char-acc . <fraction of matching chars>)"
+  "Deterministic NLL + greedy generation + prefix / per-char scores.
+   Returns an alist."
   (let* ((n-exp (length expected))
          (nll   (score-nll params spec vocab prompt expected))
          (full  (generate params spec vocab prompt :n-tokens n-exp :greedy t))
@@ -257,11 +376,11 @@
 ;;; ------------------------------------------------------------------
 
 (defun run-experiment (manifest-path)
-  "Read the experiment manifest at MANIFEST-PATH, run tests, write logs.
-   Manifest keys:
-     :model         (required) — string, base name of models/NAME.ravn
-     :tests         (optional) — list of filenames (in tests/) or :ALL (default)
-     :description   (optional) — free text, copied into the summary
+  "Read the experiment manifest at MANIFEST-PATH (an alist file), run
+   tests, write logs. Manifest keys:
+     :model        (required) — string, base name of models/NAME.ravn
+     :tests        (optional) — list of filenames in tests/, or :ALL (default)
+     :description  (optional) — free text, copied into the summary
    Returns the path of the experiment directory."
   (let* ((manifest     (load-sexp manifest-path))
          (model-name   (cdr (assoc :model manifest)))
@@ -366,27 +485,27 @@
 ;;; ------------------------------------------------------------------
 
 (defun test-jig ()
-  "Self-contained: creates a temp corpus, trains + registers a tiny
-   model, writes a synthetic test file + experiment manifest, runs the
-   experiment, verifies all expected output files exist."
+  "End-to-end: writes a synthetic corpus, a .model spec, a test file,
+   and an experiment manifest; runs TRAIN-AND-REGISTER and RUN-EXPERIMENT
+   against them; verifies expected output files exist."
   (format t "~&=== test-jig: end-to-end jig sanity ===~%")
   (let* ((root (concatenate 'string "/tmp/raven-jig-" (current-timestamp) "/"))
          (corpus-path   (concatenate 'string root "corpus.txt"))
          (test-path     (concatenate 'string root "tests/simple.txt"))
-         (manifest-path (concatenate 'string root "experiments/my-run.manifest"))
+         (exp-manifest  (concatenate 'string root "experiments/my-run.manifest"))
          (*models-dir*      (concatenate 'string root "models/"))
          (*tests-dir*       (concatenate 'string root "tests/"))
          (*experiments-dir* (concatenate 'string root "experiments/")))
     (ensure-directories-exist *models-dir*)
     (ensure-directories-exist *tests-dir*)
     (ensure-directories-exist *experiments-dir*)
-    ;; Synthetic corpus (repeating so model can learn it).
+    ;; Synthetic corpus.
     (with-open-file (s corpus-path :direction :output
                                     :if-exists :supersede
                                     :if-does-not-exist :create)
       (dotimes (i 200) (declare (ignore i))
         (write-string "the quick brown fox " s)))
-    ;; Synthetic test file.
+    ;; Test challenges.
     (with-open-file (s test-path :direction :output
                                   :if-exists :supersede
                                   :if-does-not-exist :create)
@@ -394,23 +513,32 @@
       (write-line "the quick brown |fox" s)
       (write-line "the quick |brown" s)
       (write-line "brown fox the |quick" s))
-    ;; Train + register a tiny model.
-    (train-and-register :name "jig-test"
-                        :corpus-path corpus-path
-                        :context 16 :d-model 16 :n-heads 2 :n-layers 1
-                        :d-ff 32 :steps 300 :log-every 100 :eval-samples 5
-                        :description "jig self-test")
-    ;; Experiment manifest.
-    (save-sexp manifest-path
+    ;; .model spec (plist, matches user-written format).
+    (save-sexp (model-spec-path "jig-test")
+               (list :corpus-path  corpus-path
+                     :context      16
+                     :d-model      16
+                     :n-heads      2
+                     :n-layers     1
+                     :d-ff         32
+                     :steps        300
+                     :log-every    100
+                     :eval-samples 5
+                     :description  "jig self-test"))
+    ;; Train + register from just the name.
+    (train-and-register "jig-test")
+    ;; Experiment manifest (alist).
+    (save-sexp exp-manifest
                (list (cons :model       "jig-test")
                      (cons :tests       '("simple.txt"))
                      (cons :description "jig self-test experiment")))
-    ;; Run.
-    (let* ((exp-dir (run-experiment manifest-path))
+    ;; Run and verify.
+    (let* ((exp-dir (run-experiment exp-manifest))
            (expected-files
              (list (concatenate 'string exp-dir "manifest.lisp")
                    (concatenate 'string exp-dir "results.log")
                    (concatenate 'string exp-dir "summary.log")
+                   (model-spec-path       "jig-test")
                    (model-manifest-path   "jig-test")
                    (model-log-path        "jig-test")
                    (model-checkpoint-path "jig-test")))
