@@ -85,18 +85,24 @@ Loss is printed periodically. When training finishes, four files exist in `model
 
 Re-running `train-and-register` overwrites the `.ravn` and `.manifest` but appends to `.log`, so retraining history is preserved.
 
-### 4. Write a test file
+### 4. Use the included test file
 
-Create `tests/raven.txt`. Each non-blank, non-comment line is one challenge with `|` splitting the prompt from the expected continuation:
+The repo ships with `tests/test1.txt` — nine challenges drawn from *The Raven*. Excerpt:
 
 ```
-; lines starting with ; are comments
-Once upon a midnight dr|eary, while I pondered, weak and weary,
-Deep into that darkness peer|ing, long I stood there wondering,
-And the silken sad uncertain rus|tling of each purple curtain
+; ---- short word completions ----
+Once upon a midnight dr|eary
+Deep into that darkness peer|ing
+
+; ---- longer contextual completions ----
+Perched upon a bust of Pallas |just above my chamber door
 ```
 
-Constraint: prompt + expected must fit in the model's `:context`. Longer challenges are recorded as skipped in `results.log`.
+Format is one challenge per line, `|` splitting prompt from expected. Lines starting with `;` are comments; blank lines are ignored.
+
+Constraint: prompt + expected must fit in the model's `:context`. Longer lines are recorded as skipped in `results.log` (the last challenge in `test1.txt` deliberately overflows the default 64-char context so you can see how the skip appears).
+
+To add your own tests, just drop another `tests/*.txt` file alongside it.
 
 ### 5. Write an experiment manifest
 
@@ -104,8 +110,8 @@ Create `experiments/eval-1.manifest`:
 
 ```lisp
 ((:model . "poe-64d-3l")
- (:tests . ("raven.txt"))
- (:description . "first evaluation of poe-64d-3l"))
+ (:tests . ("test1.txt"))
+ (:description . "first evaluation of poe-64d-3l on The Raven excerpts"))
 ```
 
 The `:tests` value can also be `:all` to run every `tests/*.txt` file.

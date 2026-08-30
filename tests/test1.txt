@@ -1,0 +1,26 @@
+; test1.txt — example challenge file for the Raven-LLM testing jig.
+;
+; Format: one challenge per line, PROMPT|EXPECTED.
+; Blank lines and lines starting with ";" are ignored.
+;
+; Constraint: prompt + expected must fit in the model's :context.
+; Longer lines are recorded as skipped in results.log (not errors, just
+; unmeasurable — the fused softmax-CE forward would run off the end of
+; positional encodings).
+
+; ---- short word completions ----
+Once upon a midnight dr|eary
+Deep into that darkness peer|ing
+'Tis some visitor, I mut|tered
+Merely this and no|thing more
+
+; ---- punctuation and quoted spans ----
+Quoth the Raven, |"Nevermore."
+Ghastly grim and ancient Raven wandering from the |Nightly shore
+
+; ---- longer contextual completions ----
+Perched upon a bust of Pallas |just above my chamber door
+Take thy beak from out my heart, and |take thy form from off my door
+
+; ---- deliberately too long for context=64 (will be recorded as skipped) ----
+And the silken sad uncertain rustling of each purple curtain |thrilled me with fantastic terrors never felt before
