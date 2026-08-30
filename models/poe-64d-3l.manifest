@@ -1,0 +1,7 @@
+((:NAME . "poe-64d-3l") (:CORPUS . "corpus/poeall.txt") (:VOCAB-SIZE . 109)
+ (:CONFIG (:CONTEXT . 64) (:D-MODEL . 64) (:N-HEADS . 4) (:N-LAYERS . 3)
+  (:D-FF . 256) (:EPS . 1.0e-5))
+ (:TRAINING (:STEPS . 500) (:LR . 0.001) (:FINAL-LOSS . 2.6340587)
+  (:EVAL-SAMPLES . 30))
+ (:TRAINED-AT . "20260829232203")
+ (:DESCRIPTION . "3-layer 64-dim GPT trained on Poe complete works"))
