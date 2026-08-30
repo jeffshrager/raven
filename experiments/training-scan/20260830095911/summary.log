@@ -1,0 +1,12 @@
+((:EXPERIMENT . "training-scan") (:RUN . "20260830095911")
+ (:MODEL-ID . "20260830095617")
+ (:SPEC :CORPUS-PATH "corpus/poeall.txt" :CONTEXT 64 :D-MODEL 64 :N-HEADS 4
+  :N-LAYERS 3 :D-FF 256 :EPS 1.0e-5 :LR 0.001 :STEPS 2000)
+ (:DESCRIPTION
+  . "Training-length scan: how much does final loss / test performance improve going from 1000 to 4000 steps, at a fixed architecture (d=64, H=4, L=3, T=64) on Poe's complete works?")
+ (:TESTS-RUN "/Users/jeffshrager/Desktop/raven/tests/test1.txt")
+ (:N-CHALLENGES . 7) (:N-SKIPPED . 2) (:MEAN-NLL . 2.3281076)
+ (:MEAN-PREFIX-MATCH . 0.14285715) (:MEAN-PER-CHAR-ACC . 0.12344322)
+ (:BY-TEST
+  ("test1.txt" (:N . 7) (:SKIPPED . 2) (:MEAN-NLL . 2.3281076)
+   (:MEAN-PREFIX-MATCH . 0.14285715) (:MEAN-PER-CHAR-ACC . 0.12344322))))
